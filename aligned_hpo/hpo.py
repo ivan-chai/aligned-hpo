@@ -94,6 +94,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  clip_hp_grad=None, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
+        if (algorithm == "sgd") and encoder_decoder:
+            raise NotImplementedError("SGD optimization can't be used with an encoder-decoder architecture.")
         params = list(params)
         if encoder_decoder:
             if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
