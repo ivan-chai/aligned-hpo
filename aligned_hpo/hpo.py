@@ -71,7 +71,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
     embeddings = model.encode(x)
     z = embeddings.detach().clone()
-    z.require_grads = True
+    z.requires_grad = True
     output = model.decode(z)
     down_loss, loss1, loss2 = criterion(output, y)
 
@@ -382,7 +382,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             grad = sum([w * all_full_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * full_down_grads)
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model.
-                closure_encoder(grad)
+                z_grad = sum([w * all_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * down_grads)
+                closure_encoder(z_grad)
 
                 # Set grads for the decoder model.
                 offset = 0

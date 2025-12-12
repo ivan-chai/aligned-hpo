@@ -113,17 +113,63 @@ class TestAlignedHPOptimizer(TestCase):
                                                    weights_parametrization=parametrization,
                                                    weights_normalization=normalization)
 
+                    def closure(down, weights, retain_graph=False, stage=None):
+                        optimizer.zero_grad()
+                        if down > 0:
+                            v = down * toy.loss_downstream(params)
+                        else:
+                            v = 0
+                        if any(w > 0 for w in weights):
+                            v = v + toy.loss_pretrain(params, weights)
+                        v.backward()
                     for step in range(2000):
-                        def closure(down, weights, retain_graph=False, stage=None):
-                            optimizer.zero_grad()
-                            if down > 0:
-                                v = down * toy.loss_downstream(params)
-                            else:
-                                v = 0
-                            if any(w > 0 for w in weights):
-                                v = v + toy.loss_pretrain(params, weights)
-                            v.backward()
                         optimizer.hpo_step(closure)
+                    try:
+                        self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=1e-2)
+                    except AssertionError:
+                        print(f"Test failed for {algorithm} {normalization} {parametrization}")
+                        raise
+
+    def test_optimizer_encoder_decoder(self):
+        torch.manual_seed(0)
+        for algorithm in ["mse", "expected-error"]:
+            for normalization in ["none", "sum", "norm"]:
+                for parametrization in ["abs", "linear"]:
+                    if (parametrization == "linear") and (normalization == "sum"):
+                        continue
+                    toy = ToyHPOQuadratic(positive=parametrization == "abs")
+                    params = torch.nn.Parameter(torch.zeros([toy.n_params]))
+                    weights = torch.nn.Parameter(torch.ones([toy.n_pretrain_weights]))
+                    decoder = torch.nn.Linear(toy.n_params, toy.n_params)
+                    optimizer = AlignedHPOptimizer([{"params": [weights]},
+                                                    {"params": decoder.parameters(), "lr": 0},  # Prevent singular matrices.
+                                                    {"params": [params]}],
+                                                   torch.optim.Adam,
+                                                   {"lr": 0.01},
+                                                   encoder_decoder=True,
+                                                   algorithm=algorithm,
+                                                   weights_parametrization=parametrization,
+                                                   weights_normalization=normalization)
+
+                    def closure(down, weights, retain_graph=False, stage=None):
+                        optimizer.zero_grad()
+                        z = params.detach().clone()
+                        z.requires_grad = True
+                        if down > 0:
+                            v = down * toy.loss_downstream(z)
+                        else:
+                            v = 0
+                        if any(w > 0 for w in weights):
+                            v = v + toy.loss_pretrain(decoder(z), weights)
+                        v.backward()
+                        return z.grad
+
+                    def closure_encoder(z_grad):
+                        optimizer.zero_grad()
+                        params.grad = z_grad
+
+                    for step in range(2000):
+                        optimizer.hpo_step(closure, closure_encoder)
                     try:
                         self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=1e-2)
                     except AssertionError:
