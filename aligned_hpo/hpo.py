@@ -388,32 +388,25 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             # Set gradients for model weights.
             output_weights.copy_(actual_weights)
-            grad = sum([w * all_full_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * full_down_grads)
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model.
                 z_grad = sum([w * all_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * down_grads)
                 closure_encoder(z_grad)
 
-                # Set grads for the decoder model.
-                offset = 0
-                for p in self.param_groups[1]["params"]:
+            # Set grads for the decoder model.
+            grad = sum([w * all_full_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * full_down_grads)
+            param_groups = [self.param_groups[1]] if self.encoder_decoder else self.param_groups[1:]
+            offset = 0
+            for group in param_groups:
+                for p in group["params"]:
                     numel = p.numel()
-                    p.grad = grad[offset:offset + numel].reshape(p.shape)
+                    p_grad = grad[offset:offset + numel].reshape(p.shape)
+                    if self.downstream_merge:
+                        down_p_grad = full_down_grads[offset:offset + numel].reshape(p.shape)
+                        p_grad = torch.where(p_grad.abs() > 0, p_grad, down_p_grad)
+                    p.grad = p_grad
                     offset += numel
-                assert grad.shape == (offset,)
-            else:
-                offset = 0
-                for group in self.param_groups[1:]:
-                    for p in group["params"]:
-                        numel = p.numel()
-                        p_grad = grad[offset:offset + numel].reshape(p.shape)
-                        if (p.grad is None) or (not self.downstream_merge):
-                            p.grad = p_grad
-                        else:
-                            down_p_grad = full_down_grads[offset:offset + numel].reshape(p.shape)
-                            p.grad = torch.where(p_grad.abs() > 0, p_grad, down_p_grad)
-                        offset += numel
-                assert offset == len(grad)
+            assert offset == len(grad)
             if after_backward_hook is not None:
                 after_backward_hook()
 
