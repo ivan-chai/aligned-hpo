@@ -216,7 +216,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if not isinstance(k, int) and k.startswith("cov_") and (v is not None):
                 res = re.match(r"cov_([0-9]+)", k)
                 if res:
-                    k = f"cov_{self.weights_names[int(res.group(0))]}"
+                    k = f"cov_{self.weights_names[int(res.group(1))]}"
                 result[k] = v.mean().item()
         return result
 
