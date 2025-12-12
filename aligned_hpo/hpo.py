@@ -9,7 +9,6 @@ from .solvers import solve_qp
 
 
 HPO_STAGE_DOWNSTREAM = "downstream"
-HPO_STAGE_BACKBONE = "backbone"
 
 
 class AlignedHPOptimizer(torch.optim.Optimizer):
@@ -21,7 +20,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
              decoder part of the model.
         base_optimizer_cls: The optimizer to use.
         base_optimizer_params: Parameters of the base optimizer.
-        names: An optional list of names for hyperparameters (for logging).
+        weights_names: An optional list of names for hyperparameters (for logging).
         downstream_weight: The weight of the downstream loss in the backbone model optimization or "merge".
             The "merge" value means inserting downstream gradients for the weights, not updated by the main loss.
         weights_parametrization: Either "linear" or "abs".
@@ -88,7 +87,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     optimizer.hpo_step(closure, closure_encoder)
     ```
     """
-    def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, names=None,
+    def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  downstream_weight="merge", weights_parametrization="abs", weights_normalization="norm", weights_smoothing=0,
                  encoder_decoder=False, algorithm="expected-error", ema=0, apply_optimizer_correction=False,
                  clip_hp_grad=None, eps=1e-6):
@@ -117,10 +116,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
         self.n_weights = len(self.param_groups[0]["params"][0])
-        if names is None:
-            names = [str(i) for i in range(self.n_weights)]
-        elif len(names) != self.n_weights:
+        if weights_names is None:
+            weights_names = [str(i) for i in range(self.n_weights)]
+        elif len(weights_names) != self.n_weights:
             raise ValueError("Names and weights lengths mismatch")
+        self.weights_names = weights_names
         if self.n_weights == 0:
             raise ValueError("Empty hyperparameters list.")
         if downstream_weight == "merge":
@@ -214,6 +214,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         result = {}
         for k, v in self._grads_cache.items():
             if not isinstance(k, int) and k.startswith("cov_") and (v is not None):
+                res = re.match(r"cov_([0-9]+)", k)
+                if res:
+                    k = f"cov_{self.weights_names[int(res.group(0))]}"
                 result[k] = v.mean().item()
         return result
 
@@ -226,11 +229,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             assert self.weights_normalization == "none"
             return weights
 
-    def hpo_step(self, closure, closure_encoder=None, use_cached_downstream=False):
+    def hpo_step(self, closure, closure_encoder=None, use_cached_downstream=False,
+                 after_backward_hook=None):
         """Make a single step.
 
         Args:
+            closure: A closure to compute inidivdual gradients.
+            closure_encoder: A closure to pass embedding gradients to the encoder.
             use_cached_downstream: Use gradients cache, don't recompute downstream gradients.
+            after_backward_hook: A function to call after gradients are estimated (gradient clipping etc.).
 
         Returns:
             Weights used in current step.
@@ -407,6 +414,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                             p.grad = torch.where(p_grad.abs() > 0, p_grad, down_p_grad)
                         offset += numel
                 assert offset == len(grad)
+            if after_backward_hook is not None:
+                after_backward_hook()
 
         self.step(inner_closure, inner=True)
         return output_weights
@@ -424,7 +433,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                                   for k, v in state_dict.get("grads_cache", {}).items()})
 
     def _gather_grads(self, stage, apply_optimizer_correction=False):
-        if self.encoder_decoder and (stage != HPO_STAGE_BACKBONE):
+        if self.encoder_decoder:
             param_groups = [self.param_groups[1]]  # Decoder.
         else:
             param_groups = self.param_groups[1:]  # All except hyperparameters.

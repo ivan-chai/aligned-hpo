@@ -3,7 +3,7 @@ import math
 import torch
 from unittest import TestCase, main
 
-from aligned_hpo import AlignedHPOptimizer, HPO_STAGE_DOWNSTREAM, HPO_STAGE_BACKBONE
+from aligned_hpo import AlignedHPOptimizer, HPO_STAGE_DOWNSTREAM
 from aligned_hpo.solvers import solve_qp
 from aligned_hpo.toy import ToyHPOQuadratic
 
