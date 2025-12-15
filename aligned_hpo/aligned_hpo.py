@@ -191,13 +191,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         assert closure is not None, "need closure"
         downstream_weight = 1
         loss_weights = torch.zeros_like(self.param_groups[0]["params"][0])
-        result = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
+        z_grads = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
+        full_grads = self._gather_grads(stage=HPO_STAGE_DOWNSTREAM)
         if self.encoder_decoder:
-            if result is None:
+            if z_grads is None:
                 raise RuntimeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-            grads = result
+            grads = torch.cat([z_grads, full_grads])
         else:
-            grads = self._gather_grads(stage=HPO_STAGE_DOWNSTREAM)
+            grads = full_grads
         self._update_grads_cache(grads, stage=HPO_STAGE_DOWNSTREAM)
 
     def remove_cache(self, stage=None):
@@ -267,22 +268,22 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             loss_weights = torch.zeros_like(logits)
 
             # Below:
+            # - z grads: gradient w.r.t. encoder output.
             # - full grads: decoder weights gradients.
-            # - clean grads: HPO grads before EMA smoothing.
-            # - grads: HPO grads after EMA smoothing.
+            # - grads: HPO grads after EMA smoothing used for weights tuning.
 
             # Compute downstream grads.
             downstream_weight = 1
-            result = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
+            z_down_grads = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
             full_down_grads = self._gather_grads(stage=HPO_STAGE_DOWNSTREAM)
-            if self.encoder_decoder and (result is None):
+            if self.encoder_decoder and (z_down_grads is None):
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
 
-            clean_down_grads = result if self.encoder_decoder else full_down_grads
             if use_cached_downstream:
                 down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
             else:
-                down_grads = self._update_grads_cache(clean_down_grads, stage=HPO_STAGE_DOWNSTREAM)
+                down_grads = torch.cat([z_down_grads, full_down_grads]) if self.encoder_decoder else full_down_grads
+                down_grads = self._update_grads_cache(down_grads, stage=HPO_STAGE_DOWNSTREAM)
             assert down_grads is not None
 
             # Caches for normalization differentiation.
@@ -295,30 +296,30 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             store_all_grads = self.algorithm in {"mse", "expected-error"}
             if store_all_grads:
                 all_grads = []
-            store_clean_grads = self.encoder_decoder
-            if store_clean_grads:
-                all_clean_grads = []
+            store_z_grads = self.encoder_decoder
+            if store_z_grads:
+                all_z_grads = []
             all_full_grads = []
 
             # Compute main losses grads.
             downstream_weight = 0
             for i, w in enumerate(weights):
                 loss_weights[i] = 1
-                result = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
+                z_grads = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
                 loss_weights[i] = 0
-                if self.encoder_decoder and (result is None):
+                if self.encoder_decoder and (z_grads is None):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
                 full_grads = self._gather_grads(stage=i, apply_optimizer_correction=self.apply_optimizer_correction)
-                clean_grads = result if self.encoder_decoder else full_grads
-                loss_grads = self._update_grads_cache(clean_grads, stage=i)
+                loss_grads = torch.cat([z_grads, full_grads]) if self.encoder_decoder else full_grads
+                loss_grads = self._update_grads_cache(loss_grads, stage=i)
                 if compute_products:
                     products[i] = down_grads @ loss_grads
                 if compute_grad_sum:
                     grad_sum += loss_grads * w
                 if store_all_grads:
                     all_grads.append(loss_grads)
-                if store_clean_grads:
-                    all_clean_grads.append(clean_grads)
+                if store_z_grads:
+                    all_z_grads.append(z_grads)
                 all_full_grads.append(full_grads)
 
             if store_all_grads:
@@ -400,7 +401,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             output_weights.copy_(actual_weights)
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model.
-                z_grad = sum([w * all_clean_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * clean_down_grads)
+                z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * z_down_grads)
                 closure_encoder(z_grad)
 
             # Set grads for the decoder model.
