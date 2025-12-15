@@ -28,6 +28,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights_smoothing: Mix weights with uniform distribution with a given weight.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
+        shared_decoder_group: A group index with decoder parameters used for weights tuning. By default, tune weights only using encoder.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
         ema: Use momentum for gradient smoothing. Can be a dictionary with "main" and "downstream" keys
             for the main and downstream losses respectively.
@@ -45,9 +46,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     Example usage (full gradients):
     ```
     optimizer = CorrHPOptimizer([{"params": [weights]},  # Weights for tuning.
-                                 {"params": model.parameters()}],
+                                 {"params": heads.parameters()},  # Loss heads parameters.
+                                 {"params": model.parameters()}],  # Other model parameters.
                                 torch.optim.Adam,
-                                lr=0.01)
+                                {"lr": 0.01})  # Optimizer parameters.
 
     output = model(x)
     down_loss, loss1, loss2 = criterion(output, y)
@@ -63,10 +65,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     Example usage (encoder-decoder):
     ```
     optimizer = CorrHPOptimizer([{"params": [weights]},  # Weights for tuning.
-                                 {"params": model.decoder.parameters()},   # Decoder.
+                                 {"params": heads.parameters()},  # Loss heads parameters.
+                                 {"params": model.decoder.parameters()},   # Shared decoder parameters (except individual heads), optional.
                                  {"params": model.encoder.parameters()}],  # Encoder.
                                 torch.optim.Adam,
-                                lr=0.01)
+                                {"lr": 0.01},  # Optimizer parameters.
+                                shared_decoder_group=2)
 
     embeddings = model.encode(x)
     z = embeddings.detach().clone()
@@ -89,19 +93,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  downstream_weight="merge", weights_parametrization="abs", weights_normalization="norm", weights_smoothing=0,
-                 encoder_decoder=False, algorithm="expected-error", ema=0, apply_optimizer_correction=False,
+                 encoder_decoder=False, shared_decoder_group=None,
+                 algorithm="expected-error", ema=0, apply_optimizer_correction=False,
                  clip_hp_grad=None, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         if (algorithm == "sgd") and encoder_decoder:
             raise NotImplementedError("SGD optimization can't be used with an encoder-decoder architecture.")
         params = list(params)
-        if encoder_decoder:
-            if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
-                raise ValueError("Expected at least three param groups with the first group being hyperparameters weights and second group being decoder weights.")
-        else:
-            if len(params) < 2 or not isinstance(params[0], dict):
-                raise ValueError("Expected at least two param groups with the first group being hyperparameters weights.")
+        if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
+            raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, second group being projectin heads weights, and third group being encoder weights.")
         if (len(params[0]["params"]) != 1) or (params[0]["params"][0].ndim != 1):
             raise ValueError("Weights must be flat.")
         if algorithm not in {"sgd", "mse", "expected-error", "none"}:
@@ -133,6 +134,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.weights_normalization = weights_normalization
         self.weights_smoothing = weights_smoothing
         self.encoder_decoder = encoder_decoder
+        self.shared_decoder_group = shared_decoder_group
         self.algorithm = algorithm
         if isinstance(ema, Number):
             ema = {k: ema for k in ["main", "downstream"]}
@@ -192,11 +194,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         downstream_weight = 1
         loss_weights = torch.zeros_like(self.param_groups[0]["params"][0])
         z_grads = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
-        full_grads = self._gather_grads(stage=HPO_STAGE_DOWNSTREAM)
+        shared_grads = self._gather_grads(gather_heads=False)
         if self.encoder_decoder:
             if z_grads is None:
                 raise RuntimeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-            grads = torch.cat([z_grads, full_grads])
+            grads = torch.cat([z_grads, shared_grads])
         else:
             grads = full_grads
         self._update_grads_cache(grads, stage=HPO_STAGE_DOWNSTREAM)
@@ -268,21 +270,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             loss_weights = torch.zeros_like(logits)
 
             # Below:
+            # - heads grads: individual heads weights gradients.
             # - z grads: gradient w.r.t. encoder output.
-            # - full grads: decoder weights gradients.
+            # - shared grads: shared decoder weights gradients.
             # - grads: HPO grads after EMA smoothing used for weights tuning.
 
             # Compute downstream grads.
             downstream_weight = 1
             z_down_grads = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
-            full_down_grads = self._gather_grads(stage=HPO_STAGE_DOWNSTREAM)
+            heads_down_grads = self._gather_grads(gather_heads=True)
+            shared_down_grads = self._gather_grads(gather_heads=False)
             if self.encoder_decoder and (z_down_grads is None):
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
 
             if use_cached_downstream:
                 down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
             else:
-                down_grads = torch.cat([z_down_grads, full_down_grads]) if self.encoder_decoder else full_down_grads
+                down_grads = torch.cat([z_down_grads, shared_down_grads]) if self.encoder_decoder else shared_down_grads
                 down_grads = self._update_grads_cache(down_grads, stage=HPO_STAGE_DOWNSTREAM)
             assert down_grads is not None
 
@@ -299,7 +303,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             store_z_grads = self.encoder_decoder
             if store_z_grads:
                 all_z_grads = []
-            all_full_grads = []
+            all_heads_grads = []
+            all_shared_grads = []
 
             # Compute main losses grads.
             downstream_weight = 0
@@ -309,8 +314,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 loss_weights[i] = 0
                 if self.encoder_decoder and (z_grads is None):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-                full_grads = self._gather_grads(stage=i, apply_optimizer_correction=self.apply_optimizer_correction)
-                loss_grads = torch.cat([z_grads, full_grads]) if self.encoder_decoder else full_grads
+                heads_grads = self._gather_grads(gather_heads=True, apply_optimizer_correction=self.apply_optimizer_correction)
+                shared_grads = self._gather_grads(gather_heads=False, apply_optimizer_correction=self.apply_optimizer_correction)
+                loss_grads = torch.cat([z_grads, shared_grads]) if self.encoder_decoder else shared_grads
                 loss_grads = self._update_grads_cache(loss_grads, stage=i)
                 if compute_products:
                     products[i] = down_grads @ loss_grads
@@ -320,7 +326,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     all_grads.append(loss_grads)
                 if store_z_grads:
                     all_z_grads.append(z_grads)
-                all_full_grads.append(full_grads)
+                all_heads_grads.append(heads_grads)
+                all_shared_grads.append(shared_grads)
 
             if store_all_grads:
                 all_grads = torch.stack(all_grads, 0)  # (W, P).
@@ -403,21 +410,36 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 # Set grads for the encoder (backbone) model.
                 z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * z_down_grads)
                 closure_encoder(z_grad)
+                del z_grad
 
-            # Set grads for the decoder model.
-            grad = sum([w * all_full_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * full_down_grads)
-            param_groups = [self.param_groups[1]] if self.encoder_decoder else self.param_groups[1:]
+            # Set grads for the shared model.
+            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * shared_down_grads)
+            if self.encoder_decoder:
+                param_groups = [self.param_groups[self.shared_decoder_group]] if self.shared_decoder_group is not None else []
+            else:
+                param_groups = self.param_groups[2:]
             offset = 0
             for group in param_groups:
                 for p in group["params"]:
                     numel = p.numel()
-                    p_grad = grad[offset:offset + numel].reshape(p.shape)
-                    if self.downstream_merge:
-                        down_p_grad = full_down_grads[offset:offset + numel].reshape(p.shape)
-                        p_grad = torch.where(p_grad.abs() > 0, p_grad, down_p_grad)
-                    p.grad = p_grad
+                    p.grad = shared_grad[offset:offset + numel].reshape(p.shape)
                     offset += numel
-            assert offset == len(grad)
+            assert offset == len(shared_grad)
+            del shared_grad
+
+            # Set grads for individual heads model.
+            heads_grad = sum([w * all_heads_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * heads_down_grads)
+            offset = 0
+            for p in self.param_groups[1]["params"]:
+                numel = p.numel()
+                p_grad = heads_grad[offset:offset + numel].reshape(p.shape)
+                if self.downstream_merge:
+                    down_p_grad = heads_down_grads[offset:offset + numel].reshape(p.shape)
+                    p_grad = torch.where(p_grad.abs() > 0, p_grad, down_p_grad)
+                p.grad = p_grad
+                offset += numel
+            assert offset == len(heads_grad)
+            del heads_grad
             if after_backward_hook is not None:
                 after_backward_hook()
 
@@ -436,11 +458,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                   for k, v in state_dict.get("grads_cache", {}).items()})
 
-    def _gather_grads(self, stage, apply_optimizer_correction=False):
-        if self.encoder_decoder:
-            param_groups = [self.param_groups[1]]  # Decoder.
+    def _gather_grads(self, gather_heads, apply_optimizer_correction=False):
+        if gather_heads:
+            param_groups = [self.param_groups[1]]
+        elif self.encoder_decoder:
+            param_groups = [self.param_groups[self.shared_decoder_group]] if self.shared_decoder_group is not None else []
         else:
-            param_groups = self.param_groups[1:]  # All except hyperparameters.
+            param_groups = self.param_groups[2:]  # All except hyperparameters and individual heads.
         grads = []
         for group in param_groups:
             for p in group["params"]:
@@ -471,4 +495,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 pass  # No need for correction.
             else:
                 raise NotImplementedError(f"Can't apply correction to {type(self.base_optimizer).__name__}")
+        if not grads:
+            return torch.zeros_like(self.param_groups[0]["params"][0][:0])
         return torch.cat(grads)

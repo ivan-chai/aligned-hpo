@@ -60,6 +60,7 @@ class TestAlignedHPOptimizer(TestCase):
                 if (parametrization == "linear") and (normalization == "sum"):
                     continue
                 optimizer = AlignedHPOptimizer([{"params": [weights]},
+                                                {"params": []},  # No heads.
                                                 {"params": [x]}],
                                                torch.optim.Adam,
                                                {"lr": 0},
@@ -106,6 +107,7 @@ class TestAlignedHPOptimizer(TestCase):
                     params = torch.nn.Parameter(torch.zeros([toy.n_params]))
                     weights = torch.nn.Parameter(torch.ones([toy.n_pretrain_weights]))
                     optimizer = AlignedHPOptimizer([{"params": [weights]},
+                                                    {"params": []},  # No heads.
                                                     {"params": [params]}],
                                                    torch.optim.Adam,
                                                    {"lr": 0.01},
