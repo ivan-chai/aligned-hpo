@@ -200,7 +200,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 raise RuntimeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
             grads = torch.cat([z_grads, shared_grads])
         else:
-            grads = full_grads
+            grads = shared_grads
         self._update_grads_cache(grads, stage=HPO_STAGE_DOWNSTREAM)
 
     def remove_cache(self, stage=None):
