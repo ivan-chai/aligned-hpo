@@ -17,6 +17,11 @@ def solve_qp(C, b, steps=100, method="SLSQP", eps=1e-6,
     n = len(C)
     C = C.cpu().double().numpy()
     b = b.cpu().double().numpy()
+
+    scale = max(C.mean(), eps ** 2)
+    C /= scale
+    b /= scale
+
     func = lambda x: 0.5 * x.T @ C @ x + b @ x
     jac = lambda x: C @ x + b
     cons = []
