@@ -45,11 +45,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
     Example usage (full gradients):
     ```
-    optimizer = CorrHPOptimizer([{"params": [weights]},  # Weights for tuning.
-                                 {"params": heads.parameters()},  # Loss heads parameters.
-                                 {"params": model.parameters()}],  # Other model parameters.
-                                torch.optim.Adam,
-                                {"lr": 0.01})  # Optimizer parameters.
+    optimizer = AlignedHPOptimizer([{"params": [weights]},  # Weights for tuning.
+                                    {"params": heads.parameters()},  # Loss heads parameters.
+                                    {"params": model.parameters()}],  # Other model parameters.
+                                   torch.optim.Adam,
+                                   {"lr": 0.01})  # Optimizer parameters.
 
     output = model(x)
     down_loss, loss1, loss2 = criterion(output, y)
@@ -64,13 +64,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
     Example usage (encoder-decoder):
     ```
-    optimizer = CorrHPOptimizer([{"params": [weights]},  # Weights for tuning.
-                                 {"params": heads.parameters()},  # Loss heads parameters.
-                                 {"params": model.decoder.parameters()},   # Shared decoder parameters (except individual heads), optional.
-                                 {"params": model.encoder.parameters()}],  # Encoder.
-                                torch.optim.Adam,
-                                {"lr": 0.01},  # Optimizer parameters.
-                                shared_decoder_group=2)
+    optimizer = AlignedHPOptimizer([{"params": [weights]},  # Weights for tuning.
+                                    {"params": heads.parameters()},  # Loss heads parameters.
+                                    {"params": model.decoder.parameters()},   # Shared decoder parameters (except individual heads), optional.
+                                    {"params": model.encoder.parameters()}],  # Encoder.
+                                   torch.optim.Adam,
+                                   {"lr": 0.01},  # Optimizer parameters.
+                                   shared_decoder_group=2)
 
     embeddings = model.encode(x)
     z = embeddings.detach().clone()
