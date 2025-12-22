@@ -34,7 +34,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             for covariances, main, and downstream gradients respectively.
         tune_on_val: Whether validation batches will be provided or not.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
-        penalty: An additional weight for the gradient norm.
         clip_hp_grad: Clipping value for hyperparameters gradients when "sgd" algorithm is used.
         kwargs: Base optimizer parameters.
 
@@ -97,7 +96,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  weights_parametrization="abs", weights_normalization="norm", weights_smoothing=0,
                  encoder_decoder=False, shared_decoder_group=None,
                  algorithm="expected-error", ema=0, downstream_weight=0, tune_on_val=False,
-                 apply_optimizer_correction=False, penalty=0, clip_hp_grad=None, eps=1e-6):
+                 apply_optimizer_correction=False, clip_hp_grad=None, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         if (algorithm == "sgd") and encoder_decoder:
@@ -146,7 +145,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.tune_on_val = tune_on_val
 
         self.apply_optimizer_correction = apply_optimizer_correction
-        self.penalty = penalty
         self.clip_hp_grad = clip_hp_grad
         self.eps = eps
 
@@ -398,8 +396,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
                 C = all_grads @ all_grads.T  # (W, W).
                 b = -(all_grads @ down_grads)  # (W).
-
-                C *= 1 + self.penalty
 
                 if self.algorithm == "expected-error":
                     all_grads_covs = [self._grads_cache[f"cov_{i}"] for i in range(self.n_weights)]
