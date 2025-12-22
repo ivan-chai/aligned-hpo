@@ -83,7 +83,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         optimizer.zero_grad()
         loss = down_weight * down_loss + weights[0] * loss1 + weights[1] * loss2
         loss.backward(retain_graph=retain_graph)
-        return z.grad  # New. Can also return a `mask` tensor with True values indicating valid grads.
+        return z.grad  # New.
 
     def closure_encoder(z_grad):
         optimizer.zero_grad()
@@ -138,7 +138,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"ema: expected dictionary with 'main', 'downstream' and optional 'cov' keys.")
         if "cov" not in ema:
             ema["cov"] = ema["main"]
+        if "z" not in ema:
+            ema["z"] = ema["downstream"]
         self.cov_momentum = ema["cov"]
+        self.z_momentum = ema["z"]
         self.main_momentum = ema["main"]
         self.downstream_momentum = ema["downstream"]
         self.downstream_weight = downstream_weight
@@ -150,6 +153,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         # TODO: use optimizer state for gradient caches.
         self._grads_cache = {HPO_STAGE_DOWNSTREAM: None} | {i: None for i in range(self.n_weights)}
+        if tune_on_val and self.algorithm != "sgd":
+            self._grads_cache.update({"z_C": None, "z_b": None})
         if algorithm == "expected-error":
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
 
@@ -158,25 +163,21 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Please, use 'hpo_step' function.")
         self.base_optimizer.step(closure)
 
-    def _update_grads_cache_impl(self, key, value, momentum=0, mask=None):
+    def _update_grads_cache_impl(self, key, value, momentum=0):
         if self._grads_cache[key] is None:
-            if mask is not None:
-                value.masked_fill_(~mask.bool(), 0)
             self._grads_cache[key] = value
         else:
-            if momentum:
+            if momentum > 0:
                 value = self._grads_cache[key] * momentum + value * (1 - momentum)
-            if mask is not None:
-                current_val = self._grads_cache[key] if self._grads_cache[key] is not None else torch.zeros_like(value)
-                self._grads_cache[key] = torch.where(mask, value, current_val)
-            else:
-                self._grads_cache[key] = value
+            self._grads_cache[key] = value
 
-    def _update_grads_cache(self, grads, mask=None, stage=None):
+    def _update_grads_cache(self, grads, stage=None):
         if stage not in self._grads_cache:
             raise ValueError(f"Unknown stage: {stage}")
         if stage == HPO_STAGE_DOWNSTREAM:
             momentum = self.downstream_momentum
+        elif stage in {"z_C", "z_b"}:
+            momentum = self.z_momentum
         else:
             assert isinstance(stage, Number)
             momentum = self.main_momentum
@@ -186,15 +187,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if (self.algorithm == "expected-error") and (cov_key in self._grads_cache):
             if self._grads_cache[stage] is not None:
                 delta = grads - self._grads_cache[stage]
-                if mask is not None:
-                    delta = delta[mask.bool()]
                 delta_sq = torch.linalg.norm(delta).square()
             else:
                 delta_sq = torch.zeros([], dtype=grads.dtype, device=grads.device)
             self._update_grads_cache_impl(cov_key, delta_sq, momentum=self.cov_momentum)
 
         # Update means.
-        self._update_grads_cache_impl(stage, grads, mask=mask, momentum=momentum)
+        self._update_grads_cache_impl(stage, grads, momentum=momentum)
         return self._grads_cache[stage]
 
     @property
@@ -237,14 +236,29 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 warnings.warn("Calling val_step, when tune_on_val is disabled.")
             return
         assert closure is not None, "need closure"
-        # Call closure.
+
+        # Cache downstream shared grads.
         downstream_weight = 1
         loss_weights = torch.zeros_like(self.param_groups[0]["params"][0])
-        torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
+        z_down_grads = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
+        shared_down_grads = self._gather_grads(gather_heads=False)
+        self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
 
-        # Update downstream grads cache.
-        shared_grads = self._gather_grads(gather_heads=False)
-        self._update_grads_cache(shared_grads, stage=HPO_STAGE_DOWNSTREAM)
+        if self.encoder_decoder and (self.algorithm != "sgd"):
+            # Cache embeddings covariances.
+            if z_down_grads is None:
+                raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
+            downstream_weight = 0
+            all_z_grads = []
+            for i in range(self.n_weights):
+                loss_weights[i] = 1
+                all_z_grads.append(closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i))
+                loss_weights[i] = 0
+            all_z_grads = torch.stack(all_z_grads)  # (W, D).
+            C = all_z_grads @ all_z_grads.T
+            b = -(all_z_grads @ z_down_grads)  # (W).
+            self._update_grads_cache(C, stage="z_C")
+            self._update_grads_cache(b, stage="z_b")
 
     def hpo_step(self, closure, closure_encoder=None, after_backward_hook=None):
         """Make a single step.
@@ -284,7 +298,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Below:
             # - heads grads: individual heads weights gradients.
             # - z grads: gradient w.r.t. encoder output.
-            # - z mask (optional): embedding mask.
             # - shared grads: shared decoder weights gradients before EMA.
             # - grads: HPO grads after EMA smoothing used for weights tuning.
 
@@ -293,12 +306,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             z_down_grads = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
             if self.encoder_decoder and (z_down_grads is None):
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-            if self.encoder_decoder and (not isinstance(z_down_grads, torch.Tensor)):
-                z_down_grads, z_mask = z_down_grads
-                z_mask = ~z_mask.bool()
-            else:
-                z_mask = None
-            # NOTE: here z_mask stores True values for padding.
             heads_down_grads = self._gather_grads(gather_heads=True)
             shared_down_grads = self._gather_grads(gather_heads=False)
 
@@ -306,12 +313,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
             else:
                 down_grads = self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
-            if self.encoder_decoder:
-                if z_mask is not None:
-                    z_down_grads.masked_fill_(z_mask, 0)
+            if self.encoder_decoder and not self.tune_on_val:
                 down_grads = torch.cat([z_down_grads, down_grads])
-            else:
-                z_mask = None
 
             # Caches for normalization differentiation.
             compute_products = self.algorithm in {"sgd"}
@@ -337,14 +340,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 loss_weights[i] = 0
                 if self.encoder_decoder and (z_grads is None):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-                if self.encoder_decoder and (not isinstance(z_grads, torch.Tensor)):
-                    z_grads, _ = z_grads  # Skip mask, which is equal to downstream z mask.
-                if z_mask is not None:
-                    z_grads.masked_fill_(z_mask, 0)
                 heads_grads = self._gather_grads(gather_heads=True, apply_optimizer_correction=self.apply_optimizer_correction)
                 shared_grads = self._gather_grads(gather_heads=False, apply_optimizer_correction=self.apply_optimizer_correction)
                 loss_grads = self._update_grads_cache(shared_grads, stage=i)
-                loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder else loss_grads
+                loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder and not self.tune_on_val else loss_grads
                 if compute_products:
                     products[i] = down_grads @ loss_grads
                 if compute_grad_sum:
@@ -396,6 +395,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
                 C = all_grads @ all_grads.T  # (W, W).
                 b = -(all_grads @ down_grads)  # (W).
+
+                if self.tune_on_val and self.encoder_decoder:
+                    C = C + self._grads_cache["z_C"]
+                    b = b + self._grads_cache["z_b"]
 
                 if self.algorithm == "expected-error":
                     all_grads_covs = [self._grads_cache[f"cov_{i}"] for i in range(self.n_weights)]
