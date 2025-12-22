@@ -498,7 +498,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         elif self.encoder_decoder:
             param_groups = [self.param_groups[self.shared_decoder_group]] if self.shared_decoder_group is not None else []
         else:
-            param_groups = self.param_groups[2:]  # All except hyperparameters and individual heads.
+            # All except hyperparameters and individual heads.
+            if (self.shared_decoder_group is not None) and (self.shared_decoder_group < 2):
+                param_groups = [self.param_groups[self.shared_decoder_group]] + self.param_groups[2:]
+            else:
+                param_groups = self.param_groups[2:]
         grads = []
         for group in param_groups:
             for p in group["params"]:
