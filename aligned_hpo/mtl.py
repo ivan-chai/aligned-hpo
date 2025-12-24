@@ -67,6 +67,8 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, weights_names, params, base_optimizer_cls, base_optimizer_params=None,
                  encoder_decoder=False, algorithm="TODO"):
+        if algorithm not in {"none"}:
+            raise ValueError(f"Unknown algorithm: {self.algorithm}")
         params = list(params)
         if len(params) < 2 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
             raise ValueError("Expected at least two param groups with the first group being individual heads parameters and the second group being shared weights.")
@@ -124,9 +126,9 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
             all_z_grads = []
             all_heads_grads = []
             all_shared_grads = []
-            for i, w in enumerate(weights):
+            for i in range(self.n_weights):
                 loss_weights[i] = 1
-                z_grads = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
+                z_grads = closure(loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
                 loss_weights[i] = 0
                 if self.encoder_decoder and (z_grads is None):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
@@ -179,22 +181,14 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
                 after_backward_hook()
 
         self.step(inner_closure, inner=True)
-        return weights
-
-    def state_dict(self):
-        state = super().state_dict()
-        state["grads_cache"] = dict(self._grads_cache)
-        return state
+        return output_weights
 
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.base_optimizer.param_groups = self.param_groups
-        p = self._get_some_parameter()
-        self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
-                                  for k, v in state_dict.get("grads_cache", {}).items()})
 
     def _get_some_parameter(self):
-        return next(p for p in group["params"] for group in self.param_groups)
+        return next(p for group in self.param_groups for p in group["params"])
 
     def _gather_grads(self, gather_heads):
         if gather_heads:
