@@ -30,7 +30,7 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
     output = model(x)
     loss1, loss2 = criterion(output, y)
 
-    def closure(weights, retain_graph=False):
+    def closure(weights, retain_graph=False, stage=None):
         optimizer.zero_grad()
         loss = weights[0] * loss1 + weights[1] * loss2
         loss.backward(retain_graph=retain_graph)
@@ -52,7 +52,7 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
     output = model.decode(z)
     loss1, loss2 = criterion(output, y)
 
-    def closure(weights, retain_graph=False):
+    def closure(weights, retain_graph=False, stage=None):
         optimizer.zero_grad()
         loss = weights[0] * loss1 + weights[1] * loss2
         loss.backward(retain_graph=retain_graph)
@@ -103,8 +103,8 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
         Returns:
             Weights used in current step.
 
-        The closure is used like this: closure(*loss_weights, retain_graph=False).
-        The closure_encoder is used like this: closure(encoder_output_grad).
+        The closure is used like this: closure(*loss_weights, retain_graph=False, stage=i).
+        The closure_encoder is used like this: closure_encoder(encoder_output_grad).
 
         Each closure must zero grads and compute gradients.
         """
@@ -114,10 +114,13 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
                 raise ValueError("Need encoder closure.")
             closure_encoder = torch.enable_grad()(closure_encoder)  # The closure should do a full forward-backward pass.
 
+        p = self._get_some_parameter()
+        output_weights = torch.empty(self.n_weights, dtype=p.dtype, device=p.device)
+
         @torch.no_grad()
         def inner_closure():
             # Compute losses grads.
-            loss_weights = torch.zeros_like(logits)
+            loss_weights = torch.zeros_like(output_weights)
             all_z_grads = []
             all_heads_grads = []
             all_shared_grads = []
@@ -134,7 +137,12 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
                 all_shared_grads.append(shared_grads)
 
             # Update gradients.
-            weights = ...
+            # TODO: PUT YOUR CODE HERE.
+            if self.algorithm == "none":
+                weights = torch.ones_like(output_weights)
+            else:
+                raise ValueError(f"Unknown algorithm: {self.algorithm}")
+            output_weights.copy_(weights)
 
             # Set gradients for encoder weights.
             if self.encoder_decoder:
@@ -146,9 +154,9 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
             # Set grads for the shared model.
             shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(weights[:-1])], weights[-1] * all_shared_grads[-1])
             if self.encoder_decoder:
-                param_groups = [self.param_groups[self.shared_decoder_group]] if self.shared_decoder_group is not None else []
+                param_groups = [self.param_groups[1]]
             else:
-                param_groups = self.param_groups[2:]
+                param_groups = self.param_groups[1:]
             offset = 0
             for group in param_groups:
                 for p in group["params"]:
@@ -161,7 +169,7 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
             # Set grads for individual heads model.
             heads_grad = sum(all_heads_grads[:-1], all_heads_grads[-1])
             offset = 0
-            for p in self.param_groups[1]["params"]:
+            for p in self.param_groups[0]["params"]:
                 numel = p.numel()
                 p.grad = heads_grad[offset:offset + numel].reshape(p.shape)
                 offset += numel
@@ -171,7 +179,7 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
                 after_backward_hook()
 
         self.step(inner_closure, inner=True)
-        return output_weights
+        return weights
 
     def state_dict(self):
         state = super().state_dict()
@@ -181,9 +189,12 @@ class MultiTaskOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.base_optimizer.param_groups = self.param_groups
-        p = self.param_groups[0]["params"][0]
+        p = self._get_some_parameter()
         self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                   for k, v in state_dict.get("grads_cache", {}).items()})
+
+    def _get_some_parameter(self):
+        return next(p for p in group["params"] for group in self.param_groups)
 
     def _gather_grads(self, gather_heads):
         if gather_heads:
