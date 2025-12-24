@@ -28,7 +28,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights_smoothing: Mix weights with uniform distribution with a given weight.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
-        shared_decoder_group: A group index with decoder parameters used for weights tuning. By default, tune weights only using encoder.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
         ema: Use momentum for gradient smoothing. Can be a dictionary with "cov", "main", "downstream", "z", and "weights" keys. See notes below.
         tune_on_val: Whether validation batches will be provided or not.
@@ -78,8 +77,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                                     {"params": model.decoder.parameters()},   # Shared decoder parameters (except individual heads), optional.
                                     {"params": model.encoder.parameters()}],  # Encoder.
                                    torch.optim.Adam,
-                                   {"lr": 0.01},  # Optimizer parameters.
-                                   shared_decoder_group=2)
+                                   {"lr": 0.01})  # Optimizer parameters.
 
     embeddings = model.encode(x)
     z = embeddings.detach().clone()
@@ -103,8 +101,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", weights_normalization="norm", weights_smoothing=0,
-                 encoder_decoder=False, shared_decoder_group=None,
-                 algorithm="expected-error", ema=0, downstream_weight=0, tune_on_val=False,
+                 encoder_decoder=False, algorithm="expected-error", ema=0, downstream_weight=0, tune_on_val=False,
                  apply_optimizer_correction=False, clip_hp_grad=None, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
@@ -138,7 +135,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.weights_normalization = weights_normalization
         self.weights_smoothing = weights_smoothing
         self.encoder_decoder = encoder_decoder
-        self.shared_decoder_group = shared_decoder_group
         self.algorithm = algorithm
 
         if isinstance(ema, Number):
@@ -471,7 +467,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Set grads for the shared model.
             shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * shared_down_grads)
             if self.encoder_decoder:
-                param_groups = [self.param_groups[self.shared_decoder_group]] if self.shared_decoder_group is not None else []
+                param_groups = [self.param_groups[2]]
             else:
                 param_groups = self.param_groups[2:]
             offset = 0
@@ -514,13 +510,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if gather_heads:
             param_groups = [self.param_groups[1]]
         elif self.encoder_decoder:
-            param_groups = [self.param_groups[self.shared_decoder_group]] if self.shared_decoder_group is not None else []
+            param_groups = [self.param_groups[2]]
         else:
             # All except hyperparameters and individual heads.
-            if (self.shared_decoder_group is not None) and (self.shared_decoder_group < 2):
-                param_groups = [self.param_groups[self.shared_decoder_group]] + self.param_groups[2:]
-            else:
-                param_groups = self.param_groups[2:]
+            param_groups = self.param_groups[2:]
         grads = []
         for group in param_groups:
             for p in group["params"]:
