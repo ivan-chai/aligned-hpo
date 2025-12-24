@@ -172,6 +172,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._grads_cache[key] = value
 
     def _update_grads_cache(self, grads, stage=None):
+        return_smoothed = True
         if stage not in self._grads_cache:
             raise ValueError(f"Unknown stage: {stage}")
         if stage == HPO_STAGE_DOWNSTREAM:
@@ -181,6 +182,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         else:
             assert isinstance(stage, Number)
             momentum = self.main_momentum
+            if (momentum == 0) and (self.algorithm == "expected-error"):
+                momentum = self.cov_momentum
+                return_smoothed = False
 
         # Update covs.
         cov_key = f"cov_{stage}"
@@ -194,7 +198,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         # Update means.
         self._update_grads_cache_impl(stage, grads, momentum=momentum)
-        return self._grads_cache[stage]
+        if return_smoothed:
+            return self._grads_cache[stage]
+        else:
+            return grads
 
     @property
     def metrics(self):
