@@ -171,10 +171,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
         self._grads_cache["weights"] = None
 
-    def step(self, closure, *, inner=False):
+    def step(self, closure=None, *, inner=False):
         if not inner:
             raise ValueError("Please, use 'hpo_step' function.")
-        self.base_optimizer.step(closure)
+        self.base_optimizer.step(closure=closure)
 
     def _update_grads_cache_impl(self, key, value, momentum=0):
         if self._grads_cache[key] is None:
