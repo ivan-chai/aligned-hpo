@@ -24,7 +24,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights_names: An optional list of names for hyperparameters (for logging).
         downstream_weight: The weight of the downstream loss in the backbone model optimization.
         weights_parametrization: Either "linear" or "abs".
-        weights_normalization: Weights normalization type ("sum", "norm", or "none").
+        weights_normalization: Weights normalization type ("sum", "norm", or "none"), or a number to divide weights by.
         weights_smoothing: Mix weights with uniform distribution with a given weight.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
@@ -41,8 +41,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     Two main parameters: "main" and "downstream", that control smoothing of the pretraining and downstream gradients respectivelly.
     There are some additional smoothing parameters:
     - "cov" can be used to control covariances estimation smoothing. By default, "cov" smoothing is equal to "main".
-    - "z" controlls smoothing of the covariances, computed for embedding in the encoder-decoder mode.
-    - "weights" controlls smoothing of weights between batches.
+    - "z" controlls smoothing of the covariances, computed for embedding in the encoder-decoder mode. By default, "z" smoothing is equal to "downstream".
+    - "weights" controlls smoothing of weights between batches. It is zero by default.
 
     NOTE. Encoder-Decoder vs full gradients.
 
@@ -116,7 +116,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
-        if weights_normalization not in ["sum", "norm", "none"]:
+        if weights_normalization not in ["sum", "norm", "none"] and not isinstance(weights_normalization, Number):
             raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
@@ -230,7 +230,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return result
 
     def _normalize_weights(self, weights):
-        if self.weights_normalization == "sum":
+        if isinstance(self.weights_normalization, Number):
+            return weights / self.weights_normalization
+        elif self.weights_normalization == "sum":
             return self.n_weights * weights / (weights.sum() + self.eps)
         elif self.weights_normalization == "norm":
             return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
