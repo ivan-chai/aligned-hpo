@@ -2,6 +2,7 @@ import math
 import re
 import numpy as np
 import torch
+import torch.nn.functional as F
 import warnings
 from copy import deepcopy
 from numbers import Number
@@ -102,7 +103,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", weights_normalization="norm", weights_smoothing=0,
                  encoder_decoder=False, algorithm="expected-error", ema=0, downstream_weight=0, tune_on_val=False,
-                 apply_optimizer_correction=False, clip_hp_grad=None, eps=1e-6):
+                 apply_optimizer_correction=False, clip_hp_grad=None, eps=1e-6, save_grad_params = None):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         if (algorithm == "sgd") and encoder_decoder:
@@ -170,6 +171,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if algorithm == "expected-error":
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
         self._grads_cache["weights"] = None
+
+        #Grad caches
+        if save_grad_params:
+            self.save_grad_params = save_grad_params
+            self._grads_cache["avg_grad_down"] = None
+            for i in range(self.n_weights):
+                self._grads_cache[f"avg_grad_{i}"] = None
+            self._grads_cache["step"] = 0
 
     def step(self, closure=None, *, inner=False):
         if not inner:
@@ -419,6 +428,40 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
                 C = all_grads @ all_grads.T  # (W, W).
                 b = -(all_grads @ down_grads)  # (W).
+                if self.save_grad_params:
+                    begin_step = self.save_grad_params.get('begin', 0)
+                    end_step = self.save_grad_params.get('end', 1000)
+                    file_name = self.save_grad_params.get('name', 'grad_logs.ckpt')
+                    
+                    self._grads_cache["step"] += 1
+                    step = self._grads_cache["step"]
+                    
+                    if step != 1 and begin_step > step:
+                        self._grads_cache["avg_grad_down"] = (
+                            self._grads_cache["avg_grad_down"].detach().cpu() * step / (step + 1)
+                            + F.normalize(down_grads.detach().cpu(), dim=0) / (step + 1)
+                        )
+                    elif begin_step >= step:
+                        self._grads_cache["avg_grad_down"] = F.normalize(
+                            down_grads.detach().cpu(), dim=0
+                        )
+                    
+                    for i, grad in enumerate(all_shared_grads):
+                        if step != 1 and begin_step > step:
+                            self._grads_cache[f"avg_grad_{i}"] = (
+                                self._grads_cache[f"avg_grad_{i}"].detach().cpu() * step / (step + 1)
+                                + F.normalize(grad.detach().cpu(), dim=0) / (step + 1)
+                            )
+                        elif begin_step >= step:
+                            self._grads_cache[f"avg_grad_{i}"] = F.normalize(
+                                grad.detach().cpu(), dim=0
+                            )
+                    
+                    
+                    if step > end_step + begin_step:
+                        torch.save(self._grads_cache, file_name)
+                        print('Directions saved')
+                        exit(0)
 
                 if self.tune_on_val and self.encoder_decoder:
                     C = C + self._grads_cache["z_C"]
@@ -458,7 +501,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             else:
                 self.param_groups[0]["params"][0].data.copy_(actual_weights)
                 self.param_groups[0]["params"][0].grad = None
-
             # Set gradients for model weights.
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model.
@@ -467,7 +509,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del z_grad
 
             # Set grads for the shared model.
-            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * shared_down_grads)
+            shared_grad = shared_down_grads
             if self.encoder_decoder:
                 param_groups = [self.param_groups[2]]
             else:
