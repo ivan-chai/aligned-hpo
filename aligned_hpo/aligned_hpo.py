@@ -173,8 +173,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._grads_cache["weights"] = None
 
         #Grad caches
+        self.save_grad_params = save_grad_params
         if save_grad_params:
-            self.save_grad_params = save_grad_params
             self._grads_cache["avg_grad_down"] = None
             for i in range(self.n_weights):
                 self._grads_cache[f"avg_grad_{i}"] = None
