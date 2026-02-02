@@ -63,7 +63,7 @@ class TestAlignedHPOptimizer(TestCase):
                                                 {"params": []},  # No heads.
                                                 {"params": [x]}],
                                                torch.optim.Adam,
-                                               {"lr": 0},
+                                               {"lr": 0.01},
                                                algorithm="sgd",
                                                weights_parametrization=parametrization,
                                                weights_normalization=normalization,
@@ -144,10 +144,11 @@ class TestAlignedHPOptimizer(TestCase):
                     weights = torch.nn.Parameter(torch.ones([toy.n_pretrain_weights]))
                     decoder = torch.nn.Linear(toy.n_params, toy.n_params)
                     optimizer = AlignedHPOptimizer([{"params": [weights]},
-                                                    {"params": decoder.parameters(), "lr": 0},  # Prevent singular matrices.
-                                                    {"params": [params]}],
+                                                    {"params": decoder.parameters()},  # Head.
+                                                    {"params": []},  # No shared decoder.
+                                                    {"params": [params]}],  # Encoder.
                                                    torch.optim.Adam,
-                                                   {"lr": 0.01},
+                                                   {"lr": 0.1},
                                                    encoder_decoder=True,
                                                    algorithm=algorithm,
                                                    weights_parametrization=parametrization,
@@ -163,7 +164,7 @@ class TestAlignedHPOptimizer(TestCase):
                             v = 0
                         if any(w > 0 for w in weights):
                             v = v + toy.loss_pretrain(decoder(z), weights)
-                        v.backward()
+                        v.backward(retain_graph=retain_graph)
                         return z.grad
 
                     def closure_encoder(z_grad):
