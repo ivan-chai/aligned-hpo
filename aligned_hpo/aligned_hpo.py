@@ -230,6 +230,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return result
 
     def _normalize_weights(self, weights):
+        if torch.linalg.norm(weights) < self.eps:
+            return weights
         if isinstance(self.weights_normalization, Number):
             return weights / self.weights_normalization
         elif self.weights_normalization == "sum":
@@ -435,9 +437,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     assert self.algorithm == "mse"
 
                 actual_weights = solve_qp(C, b, eps=self.eps, positive=positive)
-                if positive and (not actual_weights.isfinite().all()):
-                    actual_weights = solve_qp(C, b, eps=self.eps, positive=False).clip(min=0)
-
                 actual_weights = self._normalize_weights(actual_weights)
             else:
                 assert self.algorithm == "none"
