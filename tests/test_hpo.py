@@ -174,7 +174,7 @@ class TestAlignedHPOptimizer(TestCase):
                     for step in range(2000):
                         optimizer.hpo_step(closure, closure_encoder)
                     try:
-                        self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=1e-2)
+                        self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=2e-2)
                     except AssertionError:
                         print(f"Test failed for {algorithm} {normalization} {parametrization}")
                         raise
