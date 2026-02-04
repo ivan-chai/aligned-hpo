@@ -35,4 +35,6 @@ def solve_qp(C, b, method="cvxopt", eps=1e-6, maxiters=100,
         weights = zeros
     if positive:
         weights = np.clip(weights, a_min=0, a_max=None)
+        if 0.5 * weights.T @ C @ weights + weights @ b > 0:
+            weights[:] = 0
     return torch.from_numpy(weights).to(dtype=dtype, device=device)

@@ -161,6 +161,46 @@ class ToyHPOQuadraticMixture:
         r = ((d.unsqueeze(-2) @ self.covs).squeeze(-2) * d).sum(-1)  # (..., k).
         return (r * self.weights).sum(-1)  # (...).
 
+class ToyHPOBow:
+    """No straight way to the optimum.
+
+    Use positive weights during optimization.
+    """
+    def __init__(self):
+        self.positive = True
+
+    @property
+    def n_params(self):
+        return 2
+
+    @property
+    def n_pretrain_weights(self):
+        return 2
+
+    @property
+    def solution(self):
+        return torch.tensor([3, 3]).float()
+
+    @property
+    def show_log(self):
+        return True
+
+    @property
+    def show_range(self):
+        rx = (-5.12, 5.12)
+        ry = (-5.12, 5.12)
+        return (rx, ry)
+
+    def loss_pretrain(self, params, weights):
+        x, y = params
+        l1 = -0.08 * x + 1 / (y + 1)
+        l2 = x + y
+        return weights[0] * l1 + weights[1] * l2
+
+    def loss_downstream(self, params):
+        x, y = params
+        return (x - 3) ** 2 + (y - 3) ** 2
+
 
 class ToyHPONoisyGrads:
     def __init__(self, toy, pretrain_noise_distribution=None, downstream_noise_distribution=None):
