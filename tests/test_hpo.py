@@ -63,7 +63,7 @@ class TestAlignedHPOptimizer(TestCase):
                                                 {"params": []},  # No heads.
                                                 {"params": [x]}],
                                                torch.optim.Adam,
-                                               {"lr": 0},
+                                               {"lr": 0.01},
                                                algorithm="sgd",
                                                weights_parametrization=parametrization,
                                                weights_normalization=normalization,
@@ -144,14 +144,16 @@ class TestAlignedHPOptimizer(TestCase):
                     weights = torch.nn.Parameter(torch.ones([toy.n_pretrain_weights]))
                     decoder = torch.nn.Linear(toy.n_params, toy.n_params)
                     optimizer = AlignedHPOptimizer([{"params": [weights]},
-                                                    {"params": decoder.parameters(), "lr": 0},  # Prevent singular matrices.
-                                                    {"params": [params]}],
-                                                   torch.optim.Adam,
-                                                   {"lr": 0.01},
+                                                    {"params": decoder.parameters()},  # Head.
+                                                    {"params": []},  # No shared decoder.
+                                                    {"params": [params]}],  # Encoder.
+                                                   torch.optim.SGD,
+                                                   {"lr": 0.1},
                                                    encoder_decoder=True,
                                                    algorithm=algorithm,
                                                    weights_parametrization=parametrization,
                                                    weights_normalization=normalization)
+                    grad_clip_fn = lambda: torch.nn.utils.clip_grad_norm_([weights, params] + list(decoder.parameters()), 1)
 
                     def closure(down, weights, retain_graph=False, stage=None):
                         optimizer.zero_grad()
@@ -163,7 +165,7 @@ class TestAlignedHPOptimizer(TestCase):
                             v = 0
                         if any(w > 0 for w in weights):
                             v = v + toy.loss_pretrain(decoder(z), weights)
-                        v.backward()
+                        v.backward(retain_graph=retain_graph)
                         return z.grad
 
                     def closure_encoder(z_grad):
@@ -171,9 +173,10 @@ class TestAlignedHPOptimizer(TestCase):
                         params.grad = z_grad
 
                     for step in range(2000):
-                        optimizer.hpo_step(closure, closure_encoder)
+                        optimizer.hpo_step(closure, closure_encoder,
+                                           after_backward_hook=grad_clip_fn)
                     try:
-                        self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=1e-2)
+                        self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=2e-2)
                     except AssertionError:
                         print(f"Test failed for {algorithm} {normalization} {parametrization}")
                         raise

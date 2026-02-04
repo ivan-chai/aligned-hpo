@@ -33,7 +33,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         tune_on_val: Whether validation batches will be provided or not.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         clip_hp_grad: Clipping value for hyperparameters gradients when "sgd" algorithm is used.
-        kwargs: Base optimizer parameters.
+        maxiters: The maximum number of iterations in the QP solver, used for "mse" and "expected-error" algorithms.
 
     NOTE. Exponential Moving Average (EMA)
 
@@ -102,7 +102,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", weights_normalization="norm", weights_smoothing=0,
                  encoder_decoder=False, algorithm="expected-error", ema=0, downstream_weight=0, tune_on_val=False,
-                 apply_optimizer_correction=False, clip_hp_grad=None, eps=1e-6):
+                 apply_optimizer_correction=False, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         if (algorithm == "sgd") and encoder_decoder:
@@ -161,6 +161,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         self.apply_optimizer_correction = apply_optimizer_correction
         self.clip_hp_grad = clip_hp_grad
+        self.maxiters = maxiters
         self.eps = eps
 
         # TODO: use optimizer state for gradient caches.
@@ -230,6 +231,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return result
 
     def _normalize_weights(self, weights):
+        if torch.linalg.norm(weights) < self.eps:
+            return weights
         if isinstance(self.weights_normalization, Number):
             return weights / self.weights_normalization
         elif self.weights_normalization == "sum":
@@ -434,10 +437,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 else:
                     assert self.algorithm == "mse"
 
-                actual_weights = solve_qp(C, b, eps=self.eps, positive=positive)
-                if positive and (not actual_weights.isfinite().all()):
-                    actual_weights = solve_qp(C, b, eps=self.eps, positive=False).clip(min=0)
-
+                actual_weights = solve_qp(C, b, positive=positive,
+                                          maxiters=self.maxiters, eps=self.eps)
                 actual_weights = self._normalize_weights(actual_weights)
             else:
                 assert self.algorithm == "none"
