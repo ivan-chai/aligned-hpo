@@ -147,12 +147,13 @@ class TestAlignedHPOptimizer(TestCase):
                                                     {"params": decoder.parameters()},  # Head.
                                                     {"params": []},  # No shared decoder.
                                                     {"params": [params]}],  # Encoder.
-                                                   torch.optim.Adam,
+                                                   torch.optim.SGD,
                                                    {"lr": 0.1},
                                                    encoder_decoder=True,
                                                    algorithm=algorithm,
                                                    weights_parametrization=parametrization,
                                                    weights_normalization=normalization)
+                    grad_clip_fn = lambda: torch.nn.utils.clip_grad_norm_([weights, params] + list(decoder.parameters()), 1)
 
                     def closure(down, weights, retain_graph=False, stage=None):
                         optimizer.zero_grad()
@@ -172,7 +173,8 @@ class TestAlignedHPOptimizer(TestCase):
                         params.grad = z_grad
 
                     for step in range(2000):
-                        optimizer.hpo_step(closure, closure_encoder)
+                        optimizer.hpo_step(closure, closure_encoder,
+                                           after_backward_hook=grad_clip_fn)
                     try:
                         self.assertAlmostEqual(torch.linalg.norm(params - toy.solution).item(), 0, delta=2e-2)
                     except AssertionError:
