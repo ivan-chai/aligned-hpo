@@ -428,40 +428,50 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
                 C = all_grads @ all_grads.T  # (W, W).
                 b = -(all_grads @ down_grads)  # (W).
-                if self.save_grad_params:
-                    begin_step = self.save_grad_params.get('begin', 0)
-                    end_step = self.save_grad_params.get('end', 1000)
-                    file_name = self.save_grad_params.get('name', 'grad_logs.ckpt')
+
+            def clip(inp_tensor, max_norm):
+                norm = inp_tensor.norm()
+                if norm > max_norm:
+                    inp_tensor.mul_(max_norm / norm)
+                return inp_tensor
+
+
+            if self.save_grad_params:
+                begin_step = self.save_grad_params.get('begin', 0)
+                end_step = self.save_grad_params.get('end', 1000)
+                file_name = self.save_grad_params.get('name', 'grad_logs.ckpt')
+                gradient_clip = self.save_grad_params.get('gradient_clip', 0)
+                
+                # Выбираем функцию обработки градиентов
+                if gradient_clip != 0:
+                    process_grad = lambda g: clip(g.detach().cpu(), gradient_clip)
+                else:
+                    process_grad = lambda g: F.normalize(g.detach().cpu(), dim=0)
+
+                self._grads_cache["step"] += 1
+                step = self._grads_cache["step"]
+                
+                if step != 1 and begin_step > step:
+                    self._grads_cache["avg_grad_down"] = (
+                        self._grads_cache["avg_grad_down"].detach().cpu() * step / (step + 1)
+                        + process_grad(down_grads) / (step + 1)
+                    )
+                elif begin_step >= step:
+                    self._grads_cache["avg_grad_down"] = process_grad(down_grads)
                     
-                    self._grads_cache["step"] += 1
-                    step = self._grads_cache["step"]
-                    
+                for i, grad in enumerate(all_shared_grads):
                     if step != 1 and begin_step > step:
-                        self._grads_cache["avg_grad_down"] = (
-                            self._grads_cache["avg_grad_down"].detach().cpu() * step / (step + 1)
-                            + F.normalize(down_grads.detach().cpu(), dim=0) / (step + 1)
+                        self._grads_cache[f"avg_grad_{i}"] = (
+                            self._grads_cache[f"avg_grad_{i}"].detach().cpu() * step / (step + 1)
+                            + process_grad(grad) / (step + 1)
                         )
                     elif begin_step >= step:
-                        self._grads_cache["avg_grad_down"] = F.normalize(
-                            down_grads.detach().cpu(), dim=0
-                        )
-                    
-                    for i, grad in enumerate(all_shared_grads):
-                        if step != 1 and begin_step > step:
-                            self._grads_cache[f"avg_grad_{i}"] = (
-                                self._grads_cache[f"avg_grad_{i}"].detach().cpu() * step / (step + 1)
-                                + F.normalize(grad.detach().cpu(), dim=0) / (step + 1)
-                            )
-                        elif begin_step >= step:
-                            self._grads_cache[f"avg_grad_{i}"] = F.normalize(
-                                grad.detach().cpu(), dim=0
-                            )
-                    
-                    
-                    if step > end_step + begin_step:
-                        torch.save(self._grads_cache, file_name)
-                        print('Directions saved')
-                        exit(0)
+                        self._grads_cache[f"avg_grad_{i}"] = process_grad(grad)
+                
+                if step > end_step + begin_step:
+                    torch.save(self._grads_cache, file_name)
+                    print('Directions saved')
+                    exit(0)
 
                 if self.tune_on_val and self.encoder_decoder:
                     C = C + self._grads_cache["z_C"]
