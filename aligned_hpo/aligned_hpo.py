@@ -524,7 +524,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                   for k, v in state_dict.get("grads_cache", {}).items()})
 
-    def _gather_grads(self, part, apply_optimizer_correction=False, clean=False):
+    def _gather_grads(self, part, apply_optimizer_correction=False):
         """Get gradients vector.
 
         Model parts:
@@ -534,7 +534,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         Args:
             part: Part of the model to extract gradients for.
-            clean: Remove gradient after extraction.
         """
         if part == "heads":
             param_groups = [self.param_groups[1]]
@@ -555,8 +554,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     grads.append(torch.zeros_like(p).flatten())
                 else:
                     grads.append(p.grad.flatten())
-                    if clean:
-                        p.grad = None
         if apply_optimizer_correction:
             # We don't pass gradient to the velocity vector for simplicity.
             if isinstance(self.base_optimizer, torch.optim.Adam):
