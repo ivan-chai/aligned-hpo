@@ -24,6 +24,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
         weights_normalization: Weights normalization type ("sum", "norm", or "none"), or a number to divide weights by.
+        downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
@@ -100,7 +101,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     ```
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
-                 weights_parametrization="abs", weights_normalization="norm",
+                 weights_parametrization="abs", weights_normalization="norm", downstream_weight=0,
                  encoder_decoder=False, algorithm="expected-error", ema=0, tune_on_val=False,
                  apply_optimizer_correction=False, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
@@ -133,6 +134,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
         self.weights_normalization = weights_normalization
+        self.downstream_weight = downstream_weight
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
 
@@ -495,7 +497,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Set gradients for model weights.
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model.
-                z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights[:-1])], actual_weights[-1] * all_z_grads[-1])
+                z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * z_down_grads)
                 closure_encoder(z_grad)
                 z_grad_norm = torch.linalg.norm(z_grad)
                 if z_grad_norm > self.eps:
@@ -506,7 +508,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del z_grad
 
             # Set grads for the shared model.
-            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights[:-1])], actual_weights[-1] * all_shared_grads[-1])
+            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * shared_down_grads)
             if self.encoder_decoder:
                 param_groups = [self.param_groups[2]]
             else:
