@@ -174,6 +174,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
         self._grads_cache["weights"] = None
+        self._buffers = {}
+
+        if self.algorithm != "sgd":
+            self._buffers["correlations"] = None
+            self._buffers["ema_correlations"] = None
+            self._buffers["avg_correlations"] = None
+            self._buffers["n_correlations"] = 0
 
     def step(self, closure=None, *, inner=False):
         if not inner:
@@ -235,6 +242,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result[k] = v.mean().item()
         if self._grads_cache.get("jacobian", None) is not None:
             result["jacobian_norm"] = self._grads_cache["jacobian"]
+        if (self.algorithm != "sgd") and (self._buffers["correlations"] is not None):
+            for name, c in zip(self.weights_names, self._buffers["correlations"]):
+                result[f"grad_correlations_{name}"] = c
+            for name, c in zip(self.weights_names, self._buffers["avg_correlations"]):
+                result[f"avg_grad_correlations_{name}"] = c
+            for name, c in zip(self.weights_names, self._buffers["ema_correlations"]):
+                result[f"ema_grad_correlations_{name}"] = c
         return result
 
     def _normalize_weights(self, weights):
@@ -439,6 +453,18 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     C = C + jacobian_norm * self._grads_cache["z_C"]
                     b = b + jacobian_norm * self._grads_cache["z_b"]
 
+                self._buffers["correlations"] = -b.detach()
+                self._buffers["n_correlations"] += 1
+                n_steps = self._buffers["n_correlations"]
+                if n_steps > 1:
+                    self._buffers["avg_correlations"] *= (n_steps - 1) / n_steps
+                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_steps
+                    self._buffers["ema_correlations"] *= self.cov_momentum
+                    self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
+                else:
+                    self._buffers["avg_correlations"] = self._buffers["correlations"]
+                    self._buffers["ema_correlations"] = self._buffers["correlations"]
+
                 if self.algorithm == "expected-error":
                     all_grads_covs = [self._grads_cache[f"cov_{i}"] for i in range(self.n_weights)]
                     if any([c is None for c in all_grads_covs]):
@@ -515,6 +541,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def state_dict(self):
         state = super().state_dict()
         state["grads_cache"] = dict(self._grads_cache)
+        state["buffers"] = dict(self._buffers)
         return state
 
     def load_state_dict(self, state_dict):
@@ -523,6 +550,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         p = self.param_groups[0]["params"][0]
         self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                   for k, v in state_dict.get("grads_cache", {}).items()})
+        self._buffers.update({k: (v.to(device=p.device, dtype=p.dtype) if isinstance(v, torch.Tensor) else v)
+                              for k, v in state_dict.get("buffers", {}).items()})
 
     def _gather_grads(self, part, apply_optimizer_correction=False):
         """Get gradients vector.
