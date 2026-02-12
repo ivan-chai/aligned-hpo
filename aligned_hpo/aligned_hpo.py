@@ -498,7 +498,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             del shared_grad
 
             # Set grads for individual heads model.
-            heads_grad = sum(all_heads_grads[i], heads_down_grads)
+            heads_grad = sum(all_heads_grads, heads_down_grads)
             offset = 0
             for p in self.param_groups[1]["params"]:
                 numel = p.numel()
