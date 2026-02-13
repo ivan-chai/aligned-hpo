@@ -25,6 +25,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights_parametrization: Either "linear" or "abs".
         weights_normalization: Weights normalization type ("sum", "norm", or "none"), or a number to divide weights by.
         downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
+        downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
@@ -101,7 +102,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     ```
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
-                 weights_parametrization="abs", weights_normalization="norm", downstream_weight=0,
+                 weights_parametrization="abs", weights_normalization="norm",
+                 downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=0, tune_on_val=False,
                  apply_optimizer_correction=False, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
@@ -135,6 +137,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.weights_parametrization = weights_parametrization
         self.weights_normalization = weights_normalization
         self.downstream_weight = downstream_weight
+        self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
 
@@ -176,13 +179,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
         self._grads_cache["weights"] = None
-        self._buffers = {}
+        self._buffers = {
+            "n_updates": 0,
+            "weights": None,
+            "ema_weights": None,
+            "avg_weights": None
+        }
 
         if self.algorithm != "sgd":
             self._buffers["correlations"] = None
             self._buffers["ema_correlations"] = None
             self._buffers["avg_correlations"] = None
-            self._buffers["n_correlations"] = 0
 
     def step(self, closure=None, *, inner=False):
         if not inner:
@@ -251,6 +258,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result[f"avg_grad_correlations_{name}"] = c
             for name, c in zip(self.weights_names, self._buffers["ema_correlations"]):
                 result[f"ema_grad_correlations_{name}"] = c
+        if self._buffers["weights"] is not None:
+            for name, c in zip(self.weights_names, self._buffers["weights"]):
+                result[f"weights_{name}"] = c
+            for name, c in zip(self.weights_names, self._buffers["avg_weights"]):
+                result[f"avg_weights_{name}"] = c
+            for name, c in zip(self.weights_names, self._buffers["ema_weights"]):
+                result[f"ema_weights_{name}"] = c
         return result
 
     def _normalize_weights(self, weights):
@@ -342,6 +356,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             else:
                 weights = logits
                 assert self.weights_parametrization == "linear"
+
+            self._buffers["n_updates"] += 1
+            n_updates = self._buffers["n_updates"]
 
             loss_weights = torch.zeros_like(logits)
 
@@ -456,11 +473,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     b = b + jacobian_norm * self._grads_cache["z_b"]
 
                 self._buffers["correlations"] = -b.detach()
-                self._buffers["n_correlations"] += 1
-                n_steps = self._buffers["n_correlations"]
-                if n_steps > 1:
-                    self._buffers["avg_correlations"] *= (n_steps - 1) / n_steps
-                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_steps
+                if n_updates > 1:
+                    self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
+                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
                     self._buffers["ema_correlations"] *= self.cov_momentum
                     self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
                 else:
@@ -487,6 +502,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             actual_weights = self._update_grads_cache(actual_weights, stage="weights")
             output_weights.copy_(actual_weights)
 
+            self._buffers["weights"] = actual_weights.detach()
+            if n_updates > 1:
+                self._buffers["avg_weights"] *= (n_updates - 1) / n_updates
+                self._buffers["avg_weights"] += self._buffers["weights"] / n_updates
+                self._buffers["ema_weights"] *= self.cov_momentum
+                self._buffers["ema_weights"] += (1 - self.cov_momentum) * self._buffers["weights"]
+            else:
+                self._buffers["avg_weights"] = self._buffers["weights"]
+                self._buffers["ema_weights"] = self._buffers["weights"]
+
             # Set hyperparameters and their grads.
             if self.algorithm == "sgd":
                 self.param_groups[0]["params"][0].grad = weight_grads
@@ -508,19 +533,29 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del z_grad
 
             # Set grads for the shared model.
-            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * shared_down_grads)
+            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights[:-1])], actual_weights[-1] * all_shared_grads[-1])
+            if self.downstream_merge:
+                mask = shared_grad == 0
+                shared_grad = torch.where(mask, shared_down_grads, shared_grad)
+                shared_down_grads.masked_fill_(mask, 0)
+                del mask
             if self.encoder_decoder:
                 param_groups = [self.param_groups[2]]
             else:
                 param_groups = self.param_groups[2:]
             offset = 0
             for i, group in enumerate(param_groups):
+                if i == 0:
+                    # Shared decoder.
+                    downstream_weight = 1
+                else:
+                    downstream_weight = self.downstream_weight
                 shared_decoder = i == 0
                 for p in group["params"]:
                     numel = p.numel()
                     p.grad = shared_grad[offset:offset + numel].reshape(p.shape)
-                    if shared_decoder:
-                        p.grad += shared_down_grads[offset:offset + numel].reshape(p.shape)
+                    if downstream_weight > 0:
+                        p.grad += downstream_weight * shared_down_grads[offset:offset + numel].reshape(p.shape)
                     offset += numel
             assert offset == len(shared_grad)
             del shared_grad
