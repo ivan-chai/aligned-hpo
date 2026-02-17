@@ -620,10 +620,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     grads.append(torch.zeros_like(p).flatten())
                 else:
                     grads.append(p.grad.flatten())
+        if not grads:
+            return torch.zeros_like(self.param_groups[0]["params"][0][:0])
+        grads = torch.cat(grads)
         if apply_optimizer_correction:
             # We don't pass gradient to the velocity vector for simplicity.
             if isinstance(self.base_optimizer, torch.optim.Adam):
-                i = 0
+                offset = 0
                 for group in param_groups:
                     _, beta2 = group["betas"]
                     eps = group["eps"]
@@ -631,17 +634,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                         state = self.base_optimizer.state[p]
                         exp_avg_sq = state.get("exp_avg_sq", None)
                         if exp_avg_sq is None:
-                            i += 1
+                            offset += p.numel()
                             continue
                         step = state["step"]
                         bias_correction2_sqrt = (1 - beta2 ** step) ** 0.5
-                        grads[i] /= exp_avg_sq.sqrt().flatten() / bias_correction2_sqrt + eps
-                        i += 1
-                assert i == len(grads)
+                        grads[offset:offset + p.numel()] /= exp_avg_sq.sqrt().flatten() / bias_correction2_sqrt + eps
+                        offset += p.numel()
+                assert offset == len(grads)
             elif isinstance(self.base_optimizer, torch.optim.SGD):
                 pass  # No need for correction.
             else:
                 raise NotImplementedError(f"Can't apply correction to {type(self.base_optimizer).__name__}")
-        if not grads:
-            return torch.zeros_like(self.param_groups[0]["params"][0][:0])
-        return torch.cat(grads)
+        return grads
