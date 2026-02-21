@@ -172,8 +172,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.apply_optimizer_correction = apply_optimizer_correction
         self.apply_gradient_normalizer = apply_gradient_normalizer
         if apply_gradient_normalizer:
-            self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6)
-            self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6)
+            self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
+            self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
         self.eps = eps
