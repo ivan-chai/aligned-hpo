@@ -1,11 +1,13 @@
+import itertools
 import math
-import re
 import numpy as np
+import re
 import torch
 import warnings
 from copy import deepcopy
 from numbers import Number
 
+from .gradient import GradientNormalizer
 from .solvers import solve_qp
 
 
@@ -31,6 +33,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
         ema: Use momentum for gradient smoothing. Can be a dictionary with "cov", "main", "downstream", "z", and "weights" keys. See notes below.
         tune_on_val: Whether validation batches will be provided or not.
+        apply_gradient_normalizer: Normalize gradients using running statistics.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         clip_hp_grad: Clipping value for hyperparameters gradients when "sgd" algorithm is used.
         maxiters: The maximum number of iterations in the QP solver, used for "mse" and "expected-error" algorithms.
@@ -105,7 +108,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  weights_parametrization="abs", weights_normalization="norm",
                  downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=0, tune_on_val=False,
-                 apply_optimizer_correction=False, clip_hp_grad=None, maxiters=100, eps=1e-6):
+                 apply_optimizer_correction=False, apply_gradient_normalizer=False,
+                 clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         if (algorithm == "sgd") and encoder_decoder:
@@ -166,6 +170,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.tune_on_val = tune_on_val
 
         self.apply_optimizer_correction = apply_optimizer_correction
+        self.apply_gradient_normalizer = apply_gradient_normalizer
+        if apply_gradient_normalizer:
+            self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6)
+            self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6)
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
         self.eps = eps
@@ -265,6 +273,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result[f"avg_weights_{name}"] = c
             for name, c in zip(self.weights_names, self._buffers["ema_weights"]):
                 result[f"ema_weights_{name}"] = c
+        if self.apply_gradient_normalizer:
+            result["heads_gradient_moving_norm"] = self.heads_gradient_normalizer.moving_norm
+            result["shared_gradient_moving_norm"] = self.shared_gradient_normalizer.moving_norm
         return result
 
     def _normalize_weights(self, weights):
@@ -572,6 +583,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if after_backward_hook is not None:
                 after_backward_hook()
 
+        if self.apply_gradient_normalizer:
+            self.heads_gradient_normalizer(self.param_groups[1]["params"])
+            self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
+
         self.step(inner_closure, inner=True)
         return output_weights
 
@@ -579,6 +594,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state = super().state_dict()
         state["grads_cache"] = dict(self._grads_cache)
         state["buffers"] = dict(self._buffers)
+        if self.apply_gradient_normalizer:
+            state["heads_gradient_normalizer"] = self.heads_gradient_normalizer.state_dict()
+            state["shared_gradient_normalizer"] = self.shared_gradient_normalizer.state_dict()
         return state
 
     def load_state_dict(self, state_dict):
@@ -589,6 +607,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                                   for k, v in state_dict.get("grads_cache", {}).items()})
         self._buffers.update({k: (v.to(device=p.device, dtype=p.dtype) if isinstance(v, torch.Tensor) else v)
                               for k, v in state_dict.get("buffers", {}).items()})
+        if self.apply_gradient_normalizer:
+             self.heads_gradient_normalizer.load_state_dict(state["heads_gradient_normalizer"])
+             self.shared_gradient_normalizer.load_state_dict(state["shared_gradient_normalizer"])
 
     def _gather_grads(self, part, apply_optimizer_correction=False):
         """Get gradients vector.
