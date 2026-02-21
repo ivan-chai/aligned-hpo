@@ -2,6 +2,7 @@ import itertools
 import math
 import numpy as np
 import re
+import scipy.optimize
 import torch
 import warnings
 from copy import deepcopy
@@ -119,7 +120,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, second group being projectin heads weights, and third group being encoder weights.")
         if (len(params[0]["params"]) != 1) or (params[0]["params"][0].ndim != 1):
             raise ValueError("Weights must be flat.")
-        if algorithm not in {"sgd", "mse", "expected-error", "none"}:
+        if algorithm not in {"sgd", "dot", "mse", "expected-error", "none"}:
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
@@ -401,7 +402,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             compute_grad_sum = (self.algorithm == "sgd") and (self.weights_normalization in {"sum", "norm"})
             if compute_grad_sum:
                 grad_sum = torch.zeros_like(down_grads)
-            store_all_grads = self.algorithm in {"mse", "expected-error"}
+            store_all_grads = self.algorithm in {"dot", "mse", "expected-error"}
             if store_all_grads:
                 all_grads = []
             store_z_grads = self.encoder_decoder
@@ -464,6 +465,25 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     grad_norm = torch.linalg.norm(weight_grads)
                     if grad_norm > self.clip_hp_grad:
                         weight_grads *= self.clip_hp_grad / (grad_norm + self.eps)
+            elif self.algorithm == "dot":
+                if self.weights_parametrization != "abs" or self.weights_normalization != "sum":
+                    raise NotImplementedError(f"{self.weights_parametrization} {self.weights_normalization}")
+
+                b = -(all_grads @ down_grads)  # (W).
+
+                self._buffers["correlations"] = -b.detach()
+                if n_updates > 1:
+                    self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
+                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
+                    self._buffers["ema_correlations"] *= self.cov_momentum
+                    self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
+                else:
+                    self._buffers["avg_correlations"] = self._buffers["correlations"]
+                    self._buffers["ema_correlations"] = self._buffers["correlations"]
+
+                actual_weights = torch.from_numpy(scipy.optimize.linprog(b.float().cpu().numpy(), A_eq=np.ones([1, len(b)]), b_eq=np.ones([1])).x).float().to(b.device).to(b.dtype)
+
+                actual_weights = self._normalize_weights(actual_weights)
             elif self.algorithm in {"mse", "expected-error"}:
                 if self.weights_parametrization == "abs":
                     positive = True
