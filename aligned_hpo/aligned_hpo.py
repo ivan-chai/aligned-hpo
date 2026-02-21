@@ -580,12 +580,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 offset += numel
             assert offset == len(heads_grad)
             del heads_grad
+
+            if self.apply_gradient_normalizer:
+                self.heads_gradient_normalizer(self.param_groups[1]["params"])
+                self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
+
             if after_backward_hook is not None:
                 after_backward_hook()
-
-        if self.apply_gradient_normalizer:
-            self.heads_gradient_normalizer(self.param_groups[1]["params"])
-            self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
 
         self.step(inner_closure, inner=True)
         return output_weights
