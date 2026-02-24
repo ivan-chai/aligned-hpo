@@ -181,7 +181,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         # TODO: use optimizer state for gradient caches.
         self._grads_cache = {HPO_STAGE_DOWNSTREAM: None} | {i: None for i in range(self.n_weights)}
-        if tune_on_val and self.algorithm != "sgd":
+        if tune_on_val and self.algorithm not in {"sgd", "none"}:
             self._grads_cache.update({"z_C": None, "z_b": None})
         if algorithm == "expected-error":
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
@@ -195,7 +195,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             "avg_weights": None
         }
 
-        if self.algorithm != "sgd":
+        if self.algorithm not in {"sgd", "none"}:
             self._buffers["correlations"] = None
             self._buffers["ema_correlations"] = None
             self._buffers["avg_correlations"] = None
@@ -229,6 +229,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             assert isinstance(stage, Number)
             momentum = self.main_momentum
             if (momentum == 0) and (self.algorithm == "expected-error"):
+                # Smooth covariance estimation, but not the value.
                 momentum = self.cov_momentum
                 return_smoothed = False
 
@@ -260,7 +261,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result[k] = v.mean().item()
         if self._grads_cache.get("jacobian", None) is not None:
             result["jacobian_norm"] = self._grads_cache["jacobian"]
-        if (self.algorithm != "sgd") and (self._buffers["correlations"] is not None):
+        if (self.algorithm not in {"sgd", "none"}) and (self._buffers["correlations"] is not None):
             for name, c in zip(self.weights_names, self._buffers["correlations"]):
                 result[f"grad_correlations_{name}"] = c
             for name, c in zip(self.weights_names, self._buffers["avg_correlations"]):
@@ -320,7 +321,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         shared_down_grads = self._gather_grads("shared")
         self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
 
-        if self.encoder_decoder and (self.algorithm != "sgd"):
+        if self.encoder_decoder and (self.algorithm not in {"sgd", "none"}):
             # Cache embeddings covariances.
             if z_down_grads is None:
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
@@ -528,6 +529,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 actual_weights = self._normalize_weights(actual_weights)
             else:
                 assert self.algorithm == "none"
+                actual_weights = torch.ones_like(weights)
                 actual_weights = self._normalize_weights(actual_weights)
 
             actual_weights = self._update_grads_cache(actual_weights, stage="weights")
