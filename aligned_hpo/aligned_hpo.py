@@ -15,6 +15,10 @@ from .solvers import solve_qp
 HPO_STAGE_DOWNSTREAM = "downstream"
 
 
+class ZeroWeightsException(Exception):
+    pass
+
+
 class AlignedHPOptimizer(torch.optim.Optimizer):
     """Aligned Hyperparameter Optimizer.
 
@@ -109,7 +113,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  weights_parametrization="abs", weights_normalization="norm",
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=0, tune_on_val=False,
-                 apply_optimizer_correction=False, apply_gradient_normalizer=False,
+                 apply_optimizer_correction=False, apply_gradient_normalizer=False, skip_step_zero_weights=True,
                  clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
@@ -146,6 +150,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
+        self.skip_step_zero_weights = skip_step_zero_weights
 
         if isinstance(ema, Number):
             ema = {k: ema for k in ["cov", "main", "downstream"]}
@@ -548,6 +553,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self._buffers["avg_weights"] = self._buffers["weights"]
                 self._buffers["ema_weights"] = self._buffers["weights"]
 
+            if (self.algorithm != "sgd") and self.skip_step_zero_weights and (torch.linalg.norm(actual_weights) < self.eps):
+                raise ZeroWeightsException()
+
             # Set hyperparameters and their grads.
             if self.algorithm == "sgd":
                 self.param_groups[0]["params"][0].grad = weight_grads
@@ -609,11 +617,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if after_backward_hook is not None:
                 after_backward_hook()
 
-        self.step(inner_closure, inner=True)
+        try:
+            self.step(inner_closure, inner=True)
+        except ZeroWeightsException:
+            pass
         return output_weights
 
     def state_dict(self):
-        state = super().state_dict()
+        state = self.base_optimizer.state_dict()
         state["grads_cache"] = dict(self._grads_cache)
         state["buffers"] = dict(self._buffers)
         if self.apply_gradient_normalizer:
@@ -622,8 +633,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return state
 
     def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
-        self.base_optimizer.param_groups = self.param_groups
+        self.base_optimizer.load_state_dict(state_dict)
+        self.param_groups = self.base_optimizer.param_groups
         p = self.param_groups[0]["params"][0]
         self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                   for k, v in state_dict.get("grads_cache", {}).items()})
