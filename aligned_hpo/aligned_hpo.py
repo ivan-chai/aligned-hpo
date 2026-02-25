@@ -634,6 +634,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
              self.heads_gradient_normalizer.load_state_dict(state["heads_gradient_normalizer"])
              self.shared_gradient_normalizer.load_state_dict(state["shared_gradient_normalizer"])
 
+    @torch.no_grad()
     def _gather_grads(self, part, apply_optimizer_correction=False):
         """Get gradients vector.
 
@@ -643,9 +644,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             encoder: Encoder part (before embedding) in the encoder-decoder model.
 
         Args:
-            part: Part of the model to extract gradients for.
+            part: Part of the model to extract gradients for (`all`, `heads`, `shared`, or `encoder`).
         """
-        if part == "heads":
+        if part == "all":
+            param_groups = self.param_groups[1:]
+        elif part == "heads":
             param_groups = [self.param_groups[1]]
         elif self.encoder_decoder:
             if part == "shared":
