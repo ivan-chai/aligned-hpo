@@ -107,7 +107,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", weights_normalization="norm",
-                 downstream_weight=0, downstream_merge=False,
+                 encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=0, tune_on_val=False,
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
                  clip_hp_grad=None, maxiters=100, eps=1e-6):
@@ -141,7 +141,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
         self.weights_normalization = weights_normalization
-        self.downstream_weight = downstream_weight
+        self.shared_downstream_weight = shared_downstream_weight
+        self.encoder_downstream_weight = encoder_downstream_weight
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
@@ -555,7 +556,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Set gradients for model weights.
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model.
-                z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.downstream_weight * z_down_grads)
+                z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.encoder_downstream_weight * z_down_grads)
                 closure_encoder(z_grad)
                 z_grad_norm = torch.linalg.norm(z_grad)
                 if z_grad_norm > self.eps:
@@ -578,11 +579,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 param_groups = self.param_groups[2:]
             offset = 0
             for i, group in enumerate(param_groups):
-                if i == 0:
-                    # Shared decoder.
-                    downstream_weight = 1
-                else:
-                    downstream_weight = self.downstream_weight
+                downstream_weight = self.shared_downstream_weight if i == 0 else self.encoder_downstream_weight
                 shared_decoder = i == 0
                 for p in group["params"]:
                     numel = p.numel()
