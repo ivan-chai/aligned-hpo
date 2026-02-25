@@ -277,8 +277,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             for name, c in zip(self.weights_names, self._buffers["ema_weights"]):
                 result[f"ema_weights_{name}"] = c
         if self.apply_gradient_normalizer:
-            result["heads_gradient_moving_norm"] = self.heads_gradient_normalizer.moving_norm
-            result["shared_gradient_moving_norm"] = self.shared_gradient_normalizer.moving_norm
+            if not self.heads_gradient_normalizer.is_first:
+                result["heads_gradient_moving_norm"] = self.heads_gradient_normalizer.moving_norm
+            if not self.shared_gradient_normalizer.is_first:
+                result["shared_gradient_moving_norm"] = self.shared_gradient_normalizer.moving_norm
         return result
 
     def _normalize_weights(self, weights):
