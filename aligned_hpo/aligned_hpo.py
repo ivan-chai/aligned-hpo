@@ -401,6 +401,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
             else:
                 down_grads = self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
+            if self.apply_optimizer_correction:
+                down_grads = down_grads.clone()
+                self.apply_optimizer_correction_("shared", down_grads)
             if self.encoder_decoder and not self.tune_on_val:
                 down_grads = torch.cat([z_down_grads, down_grads])
 
@@ -428,9 +431,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 loss_weights[i] = 0
                 if self.encoder_decoder and (z_grads is None):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-                heads_grads = self._gather_grads("heads", apply_optimizer_correction=self.apply_optimizer_correction)
-                shared_grads = self._gather_grads("shared", apply_optimizer_correction=self.apply_optimizer_correction)
+                heads_grads = self._gather_grads("heads")
+                shared_grads = self._gather_grads("shared")
                 loss_grads = self._update_grads_cache(shared_grads, stage=i)
+                if self.apply_optimizer_correction:
+                    loss_grads = loss_grads.clone()
+                    self.apply_optimizer_correction_("shared", loss_grads)
                 loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder and not self.tune_on_val else loss_grads
                 if compute_products:
                     products[i] = down_grads @ loss_grads
@@ -645,7 +651,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
              self.shared_gradient_normalizer.load_state_dict(state["shared_gradient_normalizer"])
 
     @torch.no_grad()
-    def _gather_grads(self, part, apply_optimizer_correction=False):
+    def _gather_grads(self, part):
         """Get gradients vector.
 
         Model parts:
@@ -679,27 +685,41 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     grads.append(p.grad.flatten())
         if not grads:
             return torch.zeros_like(self.param_groups[0]["params"][0][:0])
-        grads = torch.cat(grads)
-        if apply_optimizer_correction:
-            # We don't pass gradient to the velocity vector for simplicity.
-            if isinstance(self.base_optimizer, torch.optim.Adam):
-                offset = 0
-                for group in param_groups:
-                    _, beta2 = group["betas"]
-                    eps = group["eps"]
-                    for p in group["params"]:
-                        state = self.base_optimizer.state[p]
-                        exp_avg_sq = state.get("exp_avg_sq", None)
-                        if exp_avg_sq is None:
-                            offset += p.numel()
-                            continue
-                        step = state["step"]
-                        bias_correction2_sqrt = (1 - beta2 ** step) ** 0.5
-                        grads[offset:offset + p.numel()] /= exp_avg_sq.sqrt().flatten() / bias_correction2_sqrt + eps
-                        offset += p.numel()
-                assert offset == len(grads)
-            elif isinstance(self.base_optimizer, torch.optim.SGD):
-                pass  # No need for correction.
+        return torch.cat(grads)
+
+    def apply_optimizer_correction_(self, part, grads):
+        if part == "all":
+            param_groups = self.param_groups[1:]
+        elif part == "heads":
+            param_groups = [self.param_groups[1]]
+        elif self.encoder_decoder:
+            if part == "shared":
+                param_groups = [self.param_groups[2]]
             else:
-                raise NotImplementedError(f"Can't apply correction to {type(self.base_optimizer).__name__}")
-        return grads
+                assert part == "encoder"
+                param_groups = self.param_groups[3:]
+        else:
+            assert part == "shared"
+            # All except hyperparameters and individual heads.
+            param_groups = self.param_groups[2:]
+        if isinstance(self.base_optimizer, torch.optim.Adam):
+            offset = 0
+            for group in param_groups:
+                _, beta2 = group["betas"]
+                eps = group["eps"]
+                for p in group["params"]:
+                    state = self.base_optimizer.state[p]
+                    exp_avg_sq = state.get("exp_avg_sq", None)
+                    if exp_avg_sq is None:
+                        offset += p.numel()
+                        continue
+                    exp_avg_sq = exp_avg_sq.flatten() * beta2 + grads[offset:offset + p.numel()].square() * (1 - beta2)
+                    step = state["step"]
+                    bias_correction2_sqrt = (1 - beta2 ** step) ** 0.5
+                    grads[offset:offset + p.numel()] /= exp_avg_sq.sqrt() / bias_correction2_sqrt + eps
+                    offset += p.numel()
+            assert offset == len(grads)
+        elif isinstance(self.base_optimizer, torch.optim.SGD):
+            pass  # No need for correction.
+        else:
+            raise NotImplementedError(f"Can't apply correction to {type(self.base_optimizer).__name__}")
