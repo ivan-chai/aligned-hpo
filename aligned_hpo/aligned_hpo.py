@@ -117,8 +117,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
-        if (algorithm == "sgd") and encoder_decoder:
-            raise NotImplementedError("SGD optimization can't be used with an encoder-decoder architecture.")
         params = list(params)
         if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, second group being projectin heads weights, and third group being encoder weights.")
@@ -187,7 +185,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         # TODO: use optimizer state for gradient caches.
         self._grads_cache = {HPO_STAGE_DOWNSTREAM: None} | {i: None for i in range(self.n_weights)}
-        if tune_on_val and self.algorithm not in {"sgd", "none"}:
+        if tune_on_val and (self.algorithm not in {"sgd", "none"}):
             self._grads_cache.update({"z_C": None, "z_b": None})
         if algorithm == "expected-error":
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
@@ -201,7 +199,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             "avg_weights": None
         }
 
-        if self.algorithm not in {"sgd", "none"}:
+        if self.algorithm != "none":
             self._buffers["correlations"] = None
             self._buffers["ema_correlations"] = None
             self._buffers["avg_correlations"] = None
@@ -372,14 +370,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         @torch.no_grad()
         def inner_closure():
             logits = self.param_groups[0]["params"][0]
-            if self.weights_parametrization == "abs":
-                weights = torch.abs(logits)
-            else:
-                weights = logits
-                assert self.weights_parametrization == "linear"
+            with torch.enable_grad():
+                if self.weights_parametrization == "abs":
+                    weights = torch.abs(logits)
+                else:
+                    weights = logits
+                    assert self.weights_parametrization == "linear"
 
             self._buffers["n_updates"] += 1
             n_updates = self._buffers["n_updates"]
+            self._buffers["correlations"] = None
 
             loss_weights = torch.zeros_like(logits)
 
@@ -453,33 +453,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 all_grads = torch.stack(all_grads, 0)  # (W, P).
 
             if self.algorithm == "sgd":
-                if self.weights_normalization == "sum":
-                    scale = self.n_weights
-                    norm = weights.sum() + self.eps
-                    product = down_grads @ grad_sum
-                    weight_grads = -products / norm + product / norm ** 2
-                    weight_grads *= scale  # Scale by the number of weights.
-                elif self.weights_normalization == "norm":
-                    scale = math.sqrt(self.n_weights)
-                    norm = torch.linalg.norm(weights) + self.eps
-                    product = down_grads @ grad_sum
-                    weight_grads = -products / norm + weights * product / (norm ** 3)
-                    weight_grads *= scale  # Scale by the norm of union vector.
-                else:
-                    assert self.weights_normalization == "none"
-                    scale = 1
-                    norm = 1
-                    weight_grads = -products
-                actual_weights = scale * weights / norm
+                self._buffers["correlations"] = products.detach()
+                with torch.enable_grad():
+                    actual_weights = self._normalize_weights(weights)
 
-                if self.weights_parametrization == "abs":
-                    weight_grads = torch.where(logits >= 0, weight_grads, -weight_grads)  # torch.sign freezes at zero.
-                else:
-                    assert self.weights_parametrization == "linear"
+                logits.grad = None
+                actual_weights.backward(-products)
                 if self.clip_hp_grad is not None:
-                    grad_norm = torch.linalg.norm(weight_grads)
+                    grad_norm = torch.linalg.norm(logits.grad)
                     if grad_norm > self.clip_hp_grad:
-                        weight_grads *= self.clip_hp_grad / (grad_norm + self.eps)
+                        logihts.grad *= self.clip_hp_grad / (grad_norm + self.eps)
             elif self.algorithm == "dot":
                 if self.weights_parametrization != "abs" or self.weights_normalization != "sum":
                     raise NotImplementedError(f"{self.weights_parametrization} {self.weights_normalization}")
@@ -487,14 +470,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 b = -(all_grads @ down_grads)  # (W).
 
                 self._buffers["correlations"] = -b.detach()
-                if n_updates > 1:
-                    self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
-                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
-                    self._buffers["ema_correlations"] *= self.cov_momentum
-                    self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
-                else:
-                    self._buffers["avg_correlations"] = self._buffers["correlations"]
-                    self._buffers["ema_correlations"] = self._buffers["correlations"]
 
                 actual_weights = torch.from_numpy(scipy.optimize.linprog(b.float().cpu().numpy(), A_eq=np.ones([1, len(b)]), b_eq=np.ones([1])).x).float().to(b.device).to(b.dtype)
 
@@ -519,14 +494,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     b = b + jacobian_norm * self._grads_cache["z_b"]
 
                 self._buffers["correlations"] = -b.detach()
-                if n_updates > 1:
-                    self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
-                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
-                    self._buffers["ema_correlations"] *= self.cov_momentum
-                    self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
-                else:
-                    self._buffers["avg_correlations"] = self._buffers["correlations"]
-                    self._buffers["ema_correlations"] = self._buffers["correlations"]
 
                 if self.algorithm == "expected-error":
                     all_grads_covs = [self._grads_cache[f"cov_{i}"] for i in range(self.n_weights)]
@@ -549,6 +516,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             actual_weights = self._update_grads_cache(actual_weights, stage="weights")
             output_weights.copy_(actual_weights)
 
+            if self._buffers["correlations"] is not None:
+                if n_updates > 1:
+                    self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
+                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
+                    self._buffers["ema_correlations"] *= self.cov_momentum
+                    self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
+                else:
+                    self._buffers["avg_correlations"] = self._buffers["correlations"]
+                    self._buffers["ema_correlations"] = self._buffers["correlations"]
+
             self._buffers["weights"] = actual_weights.detach()
             if n_updates > 1:
                 self._buffers["avg_weights"] *= (n_updates - 1) / n_updates
@@ -564,16 +541,19 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             # Set hyperparameters and their grads.
             if self.algorithm == "sgd":
-                self.param_groups[0]["params"][0].grad = weight_grads
+                assert logits.grad is not None
             else:
-                self.param_groups[0]["params"][0].data.copy_(actual_weights)
-                self.param_groups[0]["params"][0].grad = None
+                logits.data.copy_(actual_weights)
+                logits.grad = None
 
             # Set gradients for model weights.
             if self.encoder_decoder:
-                # Set grads for the encoder (backbone) model.
+                # Set grads for the encoder (backbone) model. Keep logits grad intact.
                 z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.encoder_downstream_weight * z_down_grads)
+                logits_grad = logits.grad
+                logits.grad = None
                 closure_encoder(z_grad)
+                logits.grad = logits_grad
                 z_grad_norm = torch.linalg.norm(z_grad)
                 if z_grad_norm > self.eps:
                     encoder_grad = self._gather_grads("encoder")
