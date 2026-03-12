@@ -133,6 +133,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.base_optimizer = base_optimizer_cls(self.param_groups, **(base_optimizer_params or {}))
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
+        weights_requires_grad = algorithm == "sgd"
+        for p in self.param_groups[0]["params"]:
+            p.requires_grad = weights_requires_grad
+
         self.n_weights = len(self.param_groups[0]["params"][0])
         if weights_names is None:
             weights_names = [str(i) for i in range(self.n_weights)]
