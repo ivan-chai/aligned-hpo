@@ -133,9 +133,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.base_optimizer = base_optimizer_cls(self.param_groups, **(base_optimizer_params or {}))
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
-        weights_requires_grad = algorithm == "sgd"
-        for p in self.param_groups[0]["params"]:
-            p.requires_grad = weights_requires_grad
 
         self.n_weights = len(self.param_groups[0]["params"][0])
         if weights_names is None:
@@ -540,15 +537,18 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self._buffers["avg_weights"] = self._buffers["weights"]
                 self._buffers["ema_weights"] = self._buffers["weights"]
 
-            if (self.algorithm != "sgd") and self.skip_step_zero_weights and (torch.linalg.norm(actual_weights) < self.eps):
-                raise ZeroWeightsException()
-
             # Set hyperparameters and their grads.
             if self.algorithm == "sgd":
                 assert logits.grad is not None
             else:
-                logits.data.copy_(actual_weights)
+                if torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1):
+                    # Synchronize weights.
+                    torch.distributed.all_reduce(actual_weights, op=torch.distributed.ReduceOp.SUM)
+                    actual_weights /= torch.distributed.get_world_size()
                 logits.grad = None
+
+            if (self.algorithm != "sgd") and self.skip_step_zero_weights and (torch.linalg.norm(actual_weights) < self.eps):
+                raise ZeroWeightsException()
 
             # Set gradients for model weights.
             if self.encoder_decoder:
