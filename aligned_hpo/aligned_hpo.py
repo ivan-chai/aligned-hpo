@@ -547,9 +547,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     actual_weights /= torch.distributed.get_world_size()
                 logits.grad = None
 
-            if (self.algorithm != "sgd") and self.skip_step_zero_weights and (torch.linalg.norm(actual_weights) < self.eps):
-                raise ZeroWeightsException()
-
             # Set gradients for model weights.
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model. Keep logits grad intact.
@@ -607,6 +604,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if after_backward_hook is not None:
                 after_backward_hook()
 
+            if (self.algorithm != "sgd") and self.skip_step_zero_weights and (torch.linalg.norm(actual_weights) < self.eps):
+                raise ZeroWeightsException()
         try:
             self.step(inner_closure, inner=True)
         except ZeroWeightsException:
