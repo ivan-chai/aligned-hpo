@@ -112,7 +112,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", weights_normalization="norm",
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
-                 encoder_decoder=False, algorithm="expected-error", ema=0, tune_on_val=False,
+                 encoder_decoder=False, algorithm="expected-error", ema=None, tune_on_val=False,
                  apply_optimizer_correction=False, apply_gradient_normalizer=False, skip_step_zero_weights=True,
                  clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
@@ -151,9 +151,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.algorithm = algorithm
         self.skip_step_zero_weights = skip_step_zero_weights
 
-        if isinstance(ema, Number):
+        if ema is None:
+            ema = {"main": 0, "downstream": 0, "cov": 0.9}
+        elif isinstance(ema, Number):
             ema = {k: ema for k in ["cov", "main", "downstream"]}
-        if ("main" not in ema) or ("downstream" not in ema):
+        elif ("main" not in ema) or ("downstream" not in ema):
             raise ValueError(f"ema: expected dictionary with 'main', 'downstream' and optional 'cov' keys.")
         if "cov" not in ema:
             ema["cov"] = ema["main"]
