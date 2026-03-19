@@ -194,7 +194,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
-        self._grads_cache["weights"] = None
+        with torch.no_grad():
+            self._grads_cache["weights"] = self.weights.clone()
         self._buffers = {
             "n_updates": 0,
             "weights": None,
@@ -206,6 +207,21 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._buffers["correlations"] = None
             self._buffers["ema_correlations"] = None
             self._buffers["avg_correlations"] = None
+
+    @property
+    def unnormalized_weights(self):
+        logits = self.param_groups[0]["params"][0]
+        if self.weights_parametrization == "abs":
+            weights = torch.abs(logits)
+        elif self.weights_parametrization == "linear":
+            weights = logits
+        else:
+            raise RuntimeError(f"Unknown parametrization: {self.weights_parametrization}")
+        return weights
+
+    @property
+    def weights(self):
+        return self._normalize_weights(self.unnormalized_weights)
 
     def step(self, closure=None, *, inner=False):
         if not inner:
@@ -374,11 +390,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         def inner_closure():
             logits = self.param_groups[0]["params"][0]
             with torch.enable_grad():
-                if self.weights_parametrization == "abs":
-                    weights = torch.abs(logits)
-                else:
-                    weights = logits
-                    assert self.weights_parametrization == "linear"
+                weights = self.weights
 
             self._buffers["n_updates"] += 1
             n_updates = self._buffers["n_updates"]
@@ -457,8 +469,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             if self.algorithm == "sgd":
                 self._buffers["correlations"] = products.detach()
-                with torch.enable_grad():
-                    actual_weights = self._normalize_weights(weights)
+                actual_weights = weights
 
                 logits.grad = None
                 actual_weights.backward(-products)
