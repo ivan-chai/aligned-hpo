@@ -426,9 +426,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             compute_products = self.algorithm in {"sgd"}
             if compute_products:
                 products = torch.zeros(self.n_weights, dtype=down_grads[0].dtype, device=down_grads[0].device)
-            compute_grad_sum = (self.algorithm == "sgd") and (self.weights_normalization in {"sum", "norm"})
-            if compute_grad_sum:
-                grad_sum = torch.zeros_like(down_grads)
             store_all_grads = self.algorithm in {"dot", "mse", "expected-error"}
             if store_all_grads:
                 all_grads = []
@@ -455,8 +452,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder and not self.tune_on_val else loss_grads
                 if compute_products:
                     products[i] = down_grads @ loss_grads
-                if compute_grad_sum:
-                    grad_sum += loss_grads * w
                 if store_all_grads:
                     all_grads.append(loss_grads)
                 if store_z_grads:
