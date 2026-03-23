@@ -35,6 +35,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
+        normalize_gradients: Whether to normalize gradient for each pretraining loss before weights estimation or not.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
         ema: Use momentum for gradient smoothing. Can be a dictionary with "cov", "main", "downstream", "z", and "weights" keys. See notes below.
         tune_on_val: Whether validation batches will be provided or not.
@@ -113,8 +114,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  weights_parametrization="abs", weights_normalization="norm",
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=None, tune_on_val=False,
-                 apply_optimizer_correction=False, apply_gradient_normalizer=False, skip_step_zero_weights=True,
-                 clip_hp_grad=None, maxiters=100, eps=1e-6):
+                 apply_optimizer_correction=False, apply_gradient_normalizer=False, normalize_gradients=False,
+                 skip_step_zero_weights=True, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         params = list(params)
@@ -122,7 +123,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, second group being projectin heads weights, and third group being encoder weights.")
         if (len(params[0]["params"]) != 1) or (params[0]["params"][0].ndim != 1):
             raise ValueError("Weights must be flat.")
-        if algorithm not in {"sgd", "dot", "mse", "expected-error", "none"}:
+        if algorithm not in {"sgd", "dot", "dot-raw", "mse", "expected-error", "none"}:
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
@@ -182,6 +183,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if apply_gradient_normalizer:
             self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
             self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
+        self.normalize_gradients = normalize_gradients
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
         self.eps = eps
@@ -192,6 +194,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._grads_cache.update({"z_C": None, "z_b": None})
         if algorithm == "expected-error":
             self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
+        if algorithm in {"dot", "dot-raw"}:
+            self._grads_cache.update({f"correlations": None})
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
         with torch.no_grad():
@@ -248,6 +252,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             momentum = self.weights_momentum
         elif stage == "jacobian":
             momentum = self.jacobian_momentum
+        elif stage == "correlations":
+            momentum = self.cov_momentum
         else:
             assert isinstance(stage, Number)
             momentum = self.main_momentum
@@ -421,12 +427,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.apply_optimizer_correction_("shared", down_grads)
             if self.encoder_decoder and not self.tune_on_val:
                 down_grads = torch.cat([z_down_grads, down_grads])
+            if self.normalize_gradients:
+                down_grads = torch.nn.functional.normalize(down_grads, dim=0)
 
             # Caches for normalization differentiation.
             compute_products = self.algorithm in {"sgd"}
             if compute_products:
                 products = torch.zeros(self.n_weights, dtype=down_grads[0].dtype, device=down_grads[0].device)
-            store_all_grads = self.algorithm in {"dot", "mse", "expected-error"}
+            store_all_grads = self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}
             if store_all_grads:
                 all_grads = []
             store_z_grads = self.encoder_decoder
@@ -450,6 +458,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     loss_grads = loss_grads.clone()
                     self.apply_optimizer_correction_("shared", loss_grads)
                 loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder and not self.tune_on_val else loss_grads
+                if self.normalize_gradients:
+                    loss_grads = torch.nn.functional.normalize(loss_grads, dim=0)
                 if compute_products:
                     products[i] = down_grads @ loss_grads
                 if store_all_grads:
@@ -472,16 +482,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     grad_norm = torch.linalg.norm(logits.grad)
                     if grad_norm > self.clip_hp_grad:
                         logihts.grad *= self.clip_hp_grad / (grad_norm + self.eps)
-            elif self.algorithm == "dot":
-                if self.weights_parametrization != "abs" or self.weights_normalization != "sum":
-                    raise NotImplementedError(f"{self.weights_parametrization} {self.weights_normalization}")
-
-                b = -(all_grads @ down_grads)  # (W).
-
-                self._buffers["correlations"] = -b.detach()
-
-                actual_weights = torch.from_numpy(scipy.optimize.linprog(b.float().cpu().numpy(), A_eq=np.ones([1, len(b)]), b_eq=np.ones([1])).x).float().to(b.device).to(b.dtype)
-
+            elif self.algorithm in {"dot", "dot-raw"}:
+                b = all_grads @ down_grads  # (W).
+                self._buffers["correlations"] = b.detach()
+                b = self._update_grads_cache(b, stage="correlations")
+                if self.algorithm == "dot":
+                    if (self.weights_parametrization != "abs") or (self.weights_normalization != "sum"):
+                        raise NotImplementedError(f"{self.weights_parametrization} {self.weights_normalization}")
+                    actual_weights = torch.from_numpy(scipy.optimize.linprog(-b.float().cpu().numpy(), A_eq=np.ones([1, len(b)]), b_eq=np.ones([1])).x).float().to(b.device).to(b.dtype)
+                else:
+                    assert self.algorithm == "dot-raw"
+                    actual_weights = b
+                    if self.weights_parametrization == "abs":
+                        actual_weights = actual_weights.clip(min=0)
+                    elif self.weights_parametrization == "none":
+                        pass
+                    else:
+                        raise NotImplementedError(self.weights_parametrization)
                 actual_weights = self._normalize_weights(actual_weights)
             elif self.algorithm in {"mse", "expected-error"}:
                 if self.weights_parametrization == "abs":
