@@ -115,7 +115,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=None, tune_on_val=False,
                  apply_optimizer_correction=False, apply_gradient_normalizer=False, normalize_gradients=False,
-                 skip_step_zero_weights=True, clip_hp_grad=None, maxiters=100, eps=1e-6):
+                 skip_step_zero_weights_limit=5, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         params = list(params)
@@ -150,7 +150,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
-        self.skip_step_zero_weights = skip_step_zero_weights
+        self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
 
         if ema is None:
             ema = {"main": 0, "downstream": 0, "cov": 0.9}
@@ -201,6 +201,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         with torch.no_grad():
             self._grads_cache["weights"] = self.weights.clone()
         self._buffers = {
+            "n_skipped_steps": 0,
             "n_updates": 0,
             "weights": None,
             "ema_weights": None,
@@ -540,6 +541,18 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 actual_weights = self._normalize_weights(actual_weights)
 
             actual_weights = self._update_grads_cache(actual_weights, stage="weights")
+
+            skip_step = False
+            if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(actual_weights) < self.eps):
+                if self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit:
+                    skip_step = True
+                else:
+                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights))
+            if skip_step:
+                self._buffers["n_skipped_steps"] += 1
+            else:
+                self._buffers["n_skipped_steps"] = 0
+
             output_weights.copy_(actual_weights)
 
             if self._buffers["correlations"] is not None:
@@ -629,7 +642,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if after_backward_hook is not None:
                 after_backward_hook()
 
-            if (self.algorithm != "sgd") and self.skip_step_zero_weights and (torch.linalg.norm(actual_weights) < self.eps):
+            if skip_step:
                 raise ZeroWeightsException()
         try:
             self.step(inner_closure, inner=True)
