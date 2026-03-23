@@ -542,19 +542,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             actual_weights = self._update_grads_cache(actual_weights, stage="weights")
 
-            skip_step = False
-            if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(actual_weights) < self.eps):
-                if self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit:
-                    skip_step = True
-                else:
-                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights))
-            if skip_step:
-                self._buffers["n_skipped_steps"] += 1
-            else:
-                self._buffers["n_skipped_steps"] = 0
-
-            output_weights.copy_(actual_weights)
-
             if self._buffers["correlations"] is not None:
                 if n_updates > 1:
                     self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
@@ -584,6 +571,20 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     torch.distributed.all_reduce(actual_weights, op=torch.distributed.ReduceOp.SUM)
                     actual_weights /= torch.distributed.get_world_size()
                 logits.grad = None
+
+            skip_step = False
+            if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(actual_weights) < self.eps):
+                if self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit:
+                    skip_step = True
+                else:
+                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights))
+            if skip_step:
+                self._buffers["n_skipped_steps"] += 1
+            else:
+                self._buffers["n_skipped_steps"] = 0
+
+            # Cache returned value.
+            output_weights.copy_(actual_weights)
 
             # Set gradients for model weights.
             if self.encoder_decoder:
