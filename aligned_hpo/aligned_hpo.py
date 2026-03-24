@@ -351,6 +351,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         loss_weights = torch.zeros_like(self.param_groups[0]["params"][0])
         z_down_grads = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
         shared_down_grads = self._gather_grads("shared")
+        if self.normalize_gradients:
+            shared_down_grads = torch.nn.functional.normalize(shared_down_grads, dim=0)
+            if z_down_grads is not None:
+                z_down_grads = torch.nn.functional.normalize(z_down_grads, dim=0)
         self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
 
         if self.encoder_decoder and (self.algorithm not in {"sgd", "none"}):
@@ -418,6 +422,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
             heads_down_grads = self._gather_grads("heads")
             shared_down_grads = self._gather_grads("shared")
+            if self.normalize_gradients:
+                heads_down_grads = torch.nn.functional.normalize(heads_down_grads, dim=0)
+                shared_down_grads = torch.nn.functional.normalize(shared_down_grads, dim=0)
+                if z_down_grads is not None:
+                    assert z_down_grads.ndim == 1
+                    z_down_grads = torch.nn.functional.normalize(z_down_grads, dim=0)
 
             if self.tune_on_val:
                 down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
@@ -428,8 +438,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.apply_optimizer_correction_("shared", down_grads)
             if self.encoder_decoder and not self.tune_on_val:
                 down_grads = torch.cat([z_down_grads, down_grads])
-            if self.normalize_gradients:
-                down_grads = torch.nn.functional.normalize(down_grads, dim=0)
 
             # Caches for normalization differentiation.
             compute_products = self.algorithm in {"sgd"}
@@ -454,13 +462,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
                 heads_grads = self._gather_grads("heads")
                 shared_grads = self._gather_grads("shared")
+                if self.normalize_gradients:
+                    heads_grads = torch.nn.functional.normalize(heads_grads, dim=0)
+                    shared_grads = torch.nn.functional.normalize(shared_grads, dim=0)
+                    if z_grads is not None:
+                        assert z_grads.ndim == 1
+                        z_grads = torch.nn.functional.normalize(z_grads, dim=0)
                 loss_grads = self._update_grads_cache(shared_grads, stage=i)
                 if self.apply_optimizer_correction:
                     loss_grads = loss_grads.clone()
                     self.apply_optimizer_correction_("shared", loss_grads)
                 loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder and not self.tune_on_val else loss_grads
-                if self.normalize_gradients:
-                    loss_grads = torch.nn.functional.normalize(loss_grads, dim=0)
                 if compute_products:
                     products[i] = down_grads @ loss_grads
                 if store_all_grads:
@@ -484,7 +496,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     if grad_norm > self.clip_hp_grad:
                         logihts.grad *= self.clip_hp_grad / (grad_norm + self.eps)
             elif self.algorithm in {"dot", "dot-raw"}:
-                b = all_grads @ down_grads  # (W).
+                b = all_grads @ torch.nn.functional.normalize(down_grads, dim=0)  # (W).
                 self._buffers["correlations"] = b.detach()
                 b = self._update_grads_cache(b, stage="correlations")
                 if self.algorithm == "dot":
@@ -495,7 +507,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     assert self.algorithm == "dot-raw"
                     actual_weights = b
                     if self.weights_parametrization == "abs":
-                        actual_weights = actual_weights.clip(min=0)
+                        if (actual_weights < 0).all():
+                            actual_weights = torch.zeros_like(actual_weights)
+                        else:
+                            actual_weights = actual_weights.clip(min=0)
+                            actual_weights = actual_weights / actual_weights.sum()
                     elif self.weights_parametrization == "none":
                         pass
                     else:
@@ -572,15 +588,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     actual_weights /= torch.distributed.get_world_size()
                 logits.grad = None
 
-            skip_step = False
             if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(actual_weights) < self.eps):
-                if self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit:
-                    skip_step = True
-                else:
-                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights))
-            if skip_step:
+                skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
+                if not skip_step:
+                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights))
             else:
+                skip_step = False
                 self._buffers["n_skipped_steps"] = 0
 
             # Cache returned value.
