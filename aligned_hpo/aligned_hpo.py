@@ -317,6 +317,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         elif self.weights_normalization.startswith("grad-norm"):
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
+            pretrain_covariances = pretrain_covariances.detach()
             norm = (weights.T @ pretrain_covariances @ weights).sqrt()
             weights = weights / (norm + self.eps)
             if self.weights_normalization == "grad-norm-sum":
@@ -325,7 +326,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
             else:
                 assert self.weights_normalization == "grad-norm"
-                return weights
+                return weights * pretrain_covariances.sum().sqrt()  # Same norm as for equal weights.
         else:
             assert self.weights_normalization == "none"
             return weights
