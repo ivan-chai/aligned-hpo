@@ -35,7 +35,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
-        normalize_gradients: Whether to normalize gradient for each pretraining loss before weights estimation or not.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
         ema: Use momentum for gradient smoothing. Can be a dictionary with "cov", "main", "downstream", "z", and "weights" keys. See notes below.
         tune_on_val: Whether validation batches will be provided or not.
@@ -114,7 +113,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  weights_parametrization="abs", weights_normalization="norm",
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="expected-error", ema=None, tune_on_val=False,
-                 apply_optimizer_correction=False, apply_gradient_normalizer=False, normalize_gradients=False,
+                 apply_optimizer_correction=False, apply_gradient_normalizer=False,
                  skip_step_zero_weights_limit=5, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
@@ -183,7 +182,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if apply_gradient_normalizer:
             self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
             self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
-        self.normalize_gradients = normalize_gradients
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
         self.eps = eps
@@ -351,10 +349,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         loss_weights = torch.zeros_like(self.param_groups[0]["params"][0])
         z_down_grads = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
         shared_down_grads = self._gather_grads("shared")
-        if self.normalize_gradients:
-            shared_down_grads = torch.nn.functional.normalize(shared_down_grads, dim=0)
-            if z_down_grads is not None:
-                z_down_grads = torch.nn.functional.normalize(z_down_grads, dim=0)
         self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
 
         if self.encoder_decoder and (self.algorithm not in {"sgd", "none"}):
@@ -422,12 +416,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
             heads_down_grads = self._gather_grads("heads")
             shared_down_grads = self._gather_grads("shared")
-            if self.normalize_gradients:
-                heads_down_grads = torch.nn.functional.normalize(heads_down_grads, dim=0)
-                shared_down_grads = torch.nn.functional.normalize(shared_down_grads, dim=0)
-                if z_down_grads is not None:
-                    assert z_down_grads.ndim == 1
-                    z_down_grads = torch.nn.functional.normalize(z_down_grads, dim=0)
 
             if self.tune_on_val:
                 down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
@@ -462,12 +450,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
                 heads_grads = self._gather_grads("heads")
                 shared_grads = self._gather_grads("shared")
-                if self.normalize_gradients:
-                    heads_grads = torch.nn.functional.normalize(heads_grads, dim=0)
-                    shared_grads = torch.nn.functional.normalize(shared_grads, dim=0)
-                    if z_grads is not None:
-                        assert z_grads.ndim == 1
-                        z_grads = torch.nn.functional.normalize(z_grads, dim=0)
                 loss_grads = self._update_grads_cache(shared_grads, stage=i)
                 if self.apply_optimizer_correction:
                     loss_grads = loss_grads.clone()
