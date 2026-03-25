@@ -30,7 +30,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         base_optimizer_params: Parameters of the base optimizer.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
-        weights_normalization: Weights normalization type ("sum", "norm", or "none"), or a number to divide weights by.
+        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", or "none"), or a number to divide weights by.
         downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
@@ -126,7 +126,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
-        if weights_normalization not in ["sum", "norm", "none"] and not isinstance(weights_normalization, Number):
+        if weights_normalization not in ["sum", "norm", "grad-norm", "none"] and not isinstance(weights_normalization, Number):
             raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
@@ -196,8 +196,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._grads_cache.update({f"correlations": None})
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
-        with torch.no_grad():
-            self._grads_cache["weights"] = self.weights.clone()
+        self._grads_cache["weights"] = None
         self._buffers = {
             "n_skipped_steps": 0,
             "n_updates": 0,
@@ -221,10 +220,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         else:
             raise RuntimeError(f"Unknown parametrization: {self.weights_parametrization}")
         return weights
-
-    @property
-    def weights(self):
-        return self._normalize_weights(self.unnormalized_weights)
 
     def step(self, closure=None, *, inner=False):
         if not inner:
@@ -310,7 +305,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result["shared_gradient_moving_norm"] = self.shared_gradient_normalizer.moving_norm
         return result
 
-    def _normalize_weights(self, weights):
+    def _normalize_weights(self, weights, pretrain_covariances=None):
         if torch.linalg.norm(weights) < self.eps:
             return weights
         if isinstance(self.weights_normalization, Number):
@@ -319,6 +314,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return self.n_weights * weights / (weights.sum() + self.eps)
         elif self.weights_normalization == "norm":
             return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
+        elif self.weights_normalization == "grad-norm":
+            if pretrain_covariances is None:
+                raise ValueError("Need covariances for grad-norm")
+            norm = (weights.T @ pretrain_covariances @ weights).sqrt()
+            return weights / (norm + self.eps)
         else:
             assert self.weights_normalization == "none"
             return weights
@@ -394,8 +394,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         @torch.no_grad()
         def inner_closure():
             logits = self.param_groups[0]["params"][0]
-            with torch.enable_grad():
-                weights = self.weights
 
             self._buffers["n_updates"] += 1
             n_updates = self._buffers["n_updates"]
@@ -431,7 +429,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             compute_products = self.algorithm in {"sgd"}
             if compute_products:
                 products = torch.zeros(self.n_weights, dtype=down_grads[0].dtype, device=down_grads[0].device)
-            store_all_grads = self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}
+            store_all_grads = (self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}) or (self.weights_normalization == "grad-norm")
             if store_all_grads:
                 all_grads = []
             store_z_grads = self.encoder_decoder
@@ -442,7 +440,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             # Compute main losses grads.
             downstream_weight = 0
-            for i, w in enumerate(weights):
+            for i in range(self.n_weights):
                 loss_weights[i] = 1
                 z_grads = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
                 loss_weights[i] = 0
@@ -464,19 +462,24 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 all_heads_grads.append(heads_grads)
                 all_shared_grads.append(shared_grads)
 
+            pretrain_covariances = None
             if store_all_grads:
                 all_grads = torch.stack(all_grads, 0)  # (W, P).
 
+                if self.weights_normalization == "grad-norm":
+                    pretrain_covariances = all_grads @ all_grads.T
+
             if self.algorithm == "sgd":
                 self._buffers["correlations"] = products.detach()
-                actual_weights = weights
+                with torch.enable_grad():
+                    actual_weights = self._normalize_weights(self.unnormalized_weights, pretrain_covariances=pretrain_covariances)
 
                 logits.grad = None
                 actual_weights.backward(-products)
                 if self.clip_hp_grad is not None:
                     grad_norm = torch.linalg.norm(logits.grad)
                     if grad_norm > self.clip_hp_grad:
-                        logihts.grad *= self.clip_hp_grad / (grad_norm + self.eps)
+                        logits.grad *= self.clip_hp_grad / (grad_norm + self.eps)
             elif self.algorithm in {"dot", "dot-raw"}:
                 b = all_grads @ torch.nn.functional.normalize(down_grads, dim=0)  # (W).
                 self._buffers["correlations"] = b.detach()
@@ -498,7 +501,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                         pass
                     else:
                         raise NotImplementedError(self.weights_parametrization)
-                actual_weights = self._normalize_weights(actual_weights)
+                actual_weights = self._normalize_weights(actual_weights, pretrain_covariances=pretrain_covariances)
             elif self.algorithm in {"mse", "expected-error"}:
                 if self.weights_parametrization == "abs":
                     positive = True
@@ -532,11 +535,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
                 actual_weights = solve_qp(C, b, positive=positive,
                                           maxiters=self.maxiters, eps=self.eps)
-                actual_weights = self._normalize_weights(actual_weights)
+                actual_weights = self._normalize_weights(actual_weights, pretrain_covariances=pretrain_covariances)
             else:
                 assert self.algorithm == "none"
-                actual_weights = torch.ones_like(weights)
-                actual_weights = self._normalize_weights(actual_weights)
+                actual_weights = torch.ones_like(logits)
+                actual_weights = self._normalize_weights(actual_weights, pretrain_covariances=pretrain_covariances)
 
             actual_weights = self._update_grads_cache(actual_weights, stage="weights")
 
@@ -574,7 +577,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
                 if not skip_step:
-                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights))
+                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights), pretrain_covariances=pretrain_covariances)
             else:
                 skip_step = False
                 self._buffers["n_skipped_steps"] = 0
