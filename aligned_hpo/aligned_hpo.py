@@ -110,9 +110,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     ```
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
-                 weights_parametrization="abs", weights_normalization="norm",
+                 weights_parametrization="abs", weights_normalization="grad-norm",
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
-                 encoder_decoder=False, algorithm="expected-error", ema=None, tune_on_val=False,
+                 encoder_decoder=False, algorithm="sgd", ema=None, tune_on_val=False,
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
                  skip_step_zero_weights_limit=5, clip_hp_grad=None, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
