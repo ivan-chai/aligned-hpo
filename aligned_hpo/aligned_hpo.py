@@ -30,7 +30,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         base_optimizer_params: Parameters of the base optimizer.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
-        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", or "none"), or a number to divide weights by.
+        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", "grad-norm-sum", "grad-norm-norm", or "none"), or a number to divide weights by.
         downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
@@ -126,7 +126,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
-        if weights_normalization not in ["sum", "norm", "grad-norm", "none"] and not isinstance(weights_normalization, Number):
+        if weights_normalization not in ["sum", "norm", "grad-norm", "grad-norm-sum", "grad-norm-norm", "none"] and not isinstance(weights_normalization, Number):
             raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
@@ -314,11 +314,18 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return self.n_weights * weights / (weights.sum() + self.eps)
         elif self.weights_normalization == "norm":
             return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
-        elif self.weights_normalization == "grad-norm":
+        elif self.weights_normalization.startswith("grad-norm"):
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
             norm = (weights.T @ pretrain_covariances @ weights).sqrt()
-            return weights / (norm + self.eps)
+            weights = weights / (norm + self.eps)
+            if self.weights_normalization == "grad-norm-sum":
+                return self.n_weights * weights / (weights.sum() + self.eps)
+            elif self.weights_normalization == "grad-norm-norm":
+                return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
+            else:
+                assert self.weights_normalization == "grad-norm"
+                return weights
         else:
             assert self.weights_normalization == "none"
             return weights
@@ -429,7 +436,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             compute_products = self.algorithm in {"sgd"}
             if compute_products:
                 products = torch.zeros(self.n_weights, dtype=down_grads[0].dtype, device=down_grads[0].device)
-            store_all_grads = (self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}) or (self.weights_normalization == "grad-norm")
+            store_all_grads = (self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}) or self.weights_normalization.startswith("grad-norm")
             if store_all_grads:
                 all_grads = []
             store_z_grads = self.encoder_decoder
@@ -466,7 +473,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if store_all_grads:
                 all_grads = torch.stack(all_grads, 0)  # (W, P).
 
-                if self.weights_normalization == "grad-norm":
+                if self.weights_normalization.startswith("grad-norm"):
                     pretrain_covariances = all_grads @ all_grads.T
 
             if self.algorithm == "sgd":
