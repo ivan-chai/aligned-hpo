@@ -43,6 +43,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         tune_on_val: Whether validation batches will be provided or not.
         apply_gradient_normalizer: Normalize gradients using running statistics.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
+        hp_simple_gd: Use simple gradient descent for the weights.
         clip_hp_grad: Clipping value for hyperparameters gradients when "sgd" algorithm is used.
         maxiters: The maximum number of iterations in the QP solver, used for "mse" and "expected-error" algorithms.
 
@@ -117,7 +118,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, tune_on_val=False,
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
-                 skip_step_zero_weights_limit=5, clip_hp_grad=None, maxiters=100, eps=1e-6):
+                 skip_step_zero_weights_limit=5, hp_simple_gd=False, clip_hp_grad=None,
+                 maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         params = list(params)
@@ -187,6 +189,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
         if algorithm == "sgd":
             self.hp_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.cov_momentum)
+        self.hp_simple_gd = hp_simple_gd
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
         self.eps = eps
@@ -663,7 +666,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         try:
             logits_orig = self.param_groups[0]["params"][0].clone()
             self.step(inner_closure, inner=True)
-            if self.algorithm == "sgd":
+            if (self.algorithm == "sgd") and self.hp_simple_gd:
                 lr = self.param_groups[0].get("lr", self.defaults.get("lr", None))
                 with torch.no_grad():
                     self.param_groups[0]["params"][0].copy_(logits_orig - lr * logits_grads)
