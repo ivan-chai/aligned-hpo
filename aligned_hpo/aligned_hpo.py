@@ -344,7 +344,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             weights = weights * equal_norm  # Same norm as for equal weights.
 
             # Unscale.
-            weights = RescaleWeights.apply(weights, 1 / (scales + 1e-12))
+            weights = weights / (scales + 1e-12)
             return weights
         else:
             assert self.weights_normalization == "none"
