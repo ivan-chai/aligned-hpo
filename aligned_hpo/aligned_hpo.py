@@ -8,7 +8,7 @@ import warnings
 from copy import deepcopy
 from numbers import Number
 
-from .gradient import GradientNormalizer
+from .gradient import GradientNormalizer, RescaleWeights
 from .solvers import solve_qp
 
 
@@ -331,9 +331,21 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
             pretrain_covariances = pretrain_covariances.detach()
+            equal_norm = pretrain_covariances.sum().sqrt()
+
+            # Scale weights and covariances.
+            scales = torch.diag(pretrain_covariances).sqrt()  # (W).
+            pretrain_covariances = pretrain_covariances / (scales[:, None] * scales[None, :] + 1e-12)
+            weights = RescaleWeights.apply(weights, scales)
+
+            # Normalize.
             norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
-            weights = weights / (norm + self.eps)
-            return weights * pretrain_covariances.sum().sqrt()  # Same norm as for equal weights.
+            weights = weights / (norm + 1e-12)
+            weights = weights * equal_norm  # Same norm as for equal weights.
+
+            # Unscale.
+            weights = RescaleWeights.apply(weights, 1 / (scales + 1e-12))
+            return weights
         else:
             assert self.weights_normalization == "none"
             return weights
