@@ -118,7 +118,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, tune_on_val=False,
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
-                 skip_step_zero_weights_limit=5, hp_simple_gd=False, clip_hp_grad=None,
+                 skip_step_zero_weights_limit=5, hp_simple_gd=True, clip_hp_grad=None,
                  maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
@@ -284,6 +284,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     @property
     def metrics(self):
         result = {}
+        for name, c in zip(self.weights_names, self.param_groups[0]["params"][0]):
+            result[f"logits_{name}"] = c
         for k, v in self._grads_cache.items():
             if not isinstance(k, int) and k.startswith("cov_") and (v is not None):
                 res = re.match(r"cov_([0-9]+)", k)
