@@ -326,7 +326,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
             pretrain_covariances = pretrain_covariances.detach()
-            norm = (weights.T @ pretrain_covariances @ weights).sqrt()
+            norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
             weights = weights / (norm + self.eps)
             return weights * pretrain_covariances.sum().sqrt()  # Same norm as for equal weights.
         else:
@@ -400,6 +400,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             closure_encoder = torch.enable_grad()(closure_encoder)  # The closure should do a full forward-backward pass.
 
         output_weights = torch.empty_like(self.param_groups[0]["params"][0])
+        logits_grads = torch.empty_like(self.param_groups[0]["params"][0])
 
         @torch.no_grad()
         def inner_closure():
@@ -649,15 +650,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.heads_gradient_normalizer(self.param_groups[1]["params"])
                 self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
             if self.algorithm == "sgd":
-                self.hp_gradient_normalizer(self.param_groups[0])
+                self.hp_gradient_normalizer(self.param_groups[0]["params"])
 
             if after_backward_hook is not None:
                 after_backward_hook()
 
+            if self.algorithm == "sgd":
+                logits_grads.copy_(self.param_groups[0]["params"][0].grad)
+
             if skip_step:
                 raise ZeroWeightsException()
         try:
+            logits_orig = self.param_groups[0]["params"][0].clone()
             self.step(inner_closure, inner=True)
+            if self.algorithm == "sgd":
+                lr = self.param_groups[0].get("lr", self.defaults.get("lr", None))
+                with torch.no_grad():
+                    self.param_groups[0]["params"][0].copy_(logits_orig - lr * logits_grads)
         except ZeroWeightsException:
             pass
         return output_weights
