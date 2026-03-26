@@ -289,7 +289,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result[k] = v.mean().item()
         if self._grads_cache.get("jacobian", None) is not None:
             result["jacobian_norm"] = self._grads_cache["jacobian"]
-        if (self.algorithm not in {"sgd", "none"}) and (self._buffers["correlations"] is not None):
+        if (self.algorithm not in {"none"}) and (self._buffers["correlations"] is not None):
             for name, c in zip(self.weights_names, self._buffers["correlations"]):
                 result[f"grad_correlations_{name}"] = c
             for name, c in zip(self.weights_names, self._buffers["avg_correlations"]):
