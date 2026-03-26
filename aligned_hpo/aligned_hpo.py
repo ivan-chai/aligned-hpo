@@ -15,6 +15,9 @@ from .solvers import solve_qp
 HPO_STAGE_DOWNSTREAM = "downstream"
 
 
+DEFAULT_EMA_COV = 0.9
+
+
 class ZeroWeightsException(Exception):
     pass
 
@@ -30,7 +33,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         base_optimizer_params: Parameters of the base optimizer.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
-        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", "grad-norm-sum", "grad-norm-norm", or "none"), or a number to divide weights by.
+        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", or "none"), or a number to divide weights by.
         downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
@@ -48,7 +51,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     There are multiple smoothing techinques that help to reduce overfitting on the val set.
     Two main parameters: "main" and "downstream", that control smoothing of the pretraining and downstream gradients respectivelly.
     There are some additional smoothing parameters:
-    - "cov" can be used to control covariances estimation smoothing. By default, "cov" smoothing is equal to "main".
+    - "cov" can be used to control covariances estimation smoothing. By default, "cov" smoothing is equal to DEFAULT_EMA_COV otherwise.
     - "z" controlls smoothing of the covariances, computed for embedding in the encoder-decoder mode. By default, "z" smoothing is equal to "downstream".
     - "weights" controlls smoothing of weights between batches. It is zero by default.
     - "jacobian" controlls smoothing of the Jacobian norm estimate. By default it is equal to main.
@@ -126,7 +129,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
-        if weights_normalization not in ["sum", "norm", "grad-norm", "grad-norm-sum", "grad-norm-norm", "none"] and not isinstance(weights_normalization, Number):
+        if weights_normalization not in ["sum", "norm", "grad-norm", "none"] and not isinstance(weights_normalization, Number):
             raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
@@ -152,13 +155,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
 
         if ema is None:
-            ema = {"main": 0, "downstream": 0, "cov": 0.9}
+            ema = {"main": 0, "downstream": 0}
         elif isinstance(ema, Number):
-            ema = {k: ema for k in ["cov", "main", "downstream"]}
+            ema = {k: ema for k in ["main", "downstream"]}
         elif ("main" not in ema) or ("downstream" not in ema):
             raise ValueError(f"ema: expected dictionary with 'main', 'downstream' and optional 'cov' keys.")
         if "cov" not in ema:
-            ema["cov"] = ema["main"]
+            ema["cov"] = DEFAULT_EMA_COV
         if "z" not in ema:
             ema["z"] = ema["downstream"]
         if "weights" not in ema:
@@ -179,6 +182,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         self.apply_optimizer_correction = apply_optimizer_correction
         self.apply_gradient_normalizer = apply_gradient_normalizer
+        if algorithm == "sgd":
+            self.hpo_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.cov_momentum)
         if apply_gradient_normalizer:
             self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
             self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
@@ -314,19 +319,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return self.n_weights * weights / (weights.sum() + self.eps)
         elif self.weights_normalization == "norm":
             return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
-        elif self.weights_normalization.startswith("grad-norm"):
+        elif self.weights_normalization == "grad-norm":
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
             pretrain_covariances = pretrain_covariances.detach()
             norm = (weights.T @ pretrain_covariances @ weights).sqrt()
             weights = weights / (norm + self.eps)
-            if self.weights_normalization == "grad-norm-sum":
-                return self.n_weights * weights / (weights.sum() + self.eps)
-            elif self.weights_normalization == "grad-norm-norm":
-                return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
-            else:
-                assert self.weights_normalization == "grad-norm"
-                return weights * pretrain_covariances.sum().sqrt()  # Same norm as for equal weights.
+            return weights * pretrain_covariances.sum().sqrt()  # Same norm as for equal weights.
         else:
             assert self.weights_normalization == "none"
             return weights
@@ -437,7 +436,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             compute_products = self.algorithm in {"sgd"}
             if compute_products:
                 products = torch.zeros(self.n_weights, dtype=down_grads[0].dtype, device=down_grads[0].device)
-            store_all_grads = (self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}) or self.weights_normalization.startswith("grad-norm")
+            store_all_grads = (self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}) or (self.weights_normalization == "grad-norm")
             if store_all_grads:
                 all_grads = []
             store_z_grads = self.encoder_decoder
@@ -474,7 +473,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if store_all_grads:
                 all_grads = torch.stack(all_grads, 0)  # (W, P).
 
-                if self.weights_normalization.startswith("grad-norm"):
+                if self.weights_normalization == "grad-norm":
                     pretrain_covariances = all_grads @ all_grads.T
 
             if self.algorithm == "sgd":
@@ -646,6 +645,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if self.apply_gradient_normalizer:
                 self.heads_gradient_normalizer(self.param_groups[1]["params"])
                 self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
+            if self.algorithm == "sgd":
+                self.hpo_gradient_normalizer(self.param_groups[0])
 
             if after_backward_hook is not None:
                 after_backward_hook()
