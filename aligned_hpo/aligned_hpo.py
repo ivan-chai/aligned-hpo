@@ -182,11 +182,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         self.apply_optimizer_correction = apply_optimizer_correction
         self.apply_gradient_normalizer = apply_gradient_normalizer
-        if algorithm == "sgd":
-            self.hpo_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.cov_momentum)
         if apply_gradient_normalizer:
             self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
             self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
+        if algorithm == "sgd":
+            self.hp_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.cov_momentum)
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
         self.eps = eps
@@ -308,6 +308,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result["heads_gradient_moving_norm"] = self.heads_gradient_normalizer.moving_norm
             if not self.shared_gradient_normalizer.is_first:
                 result["shared_gradient_moving_norm"] = self.shared_gradient_normalizer.moving_norm
+        if self.algorithm == "sgd":
+            if not self.hp_gradient_normalizer.is_first:
+                result["hp_gradient_moving_norm"] = self.hp_gradient_normalizer.moving_norm
         return result
 
     def _normalize_weights(self, weights, pretrain_covariances=None):
@@ -646,7 +649,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.heads_gradient_normalizer(self.param_groups[1]["params"])
                 self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
             if self.algorithm == "sgd":
-                self.hpo_gradient_normalizer(self.param_groups[0])
+                self.hp_gradient_normalizer(self.param_groups[0])
 
             if after_backward_hook is not None:
                 after_backward_hook()
@@ -666,6 +669,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.apply_gradient_normalizer:
             state["heads_gradient_normalizer"] = self.heads_gradient_normalizer.state_dict()
             state["shared_gradient_normalizer"] = self.shared_gradient_normalizer.state_dict()
+        if self.algorithm == "sgd":
+            state["hp_gradient_normalizer"] = self.hp_gradient_normalizer.state_dict()
         return state
 
     def load_state_dict(self, state_dict):
@@ -679,6 +684,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.apply_gradient_normalizer:
              self.heads_gradient_normalizer.load_state_dict(state["heads_gradient_normalizer"])
              self.shared_gradient_normalizer.load_state_dict(state["shared_gradient_normalizer"])
+        if self.algorithm == "sgd":
+             self.hp_gradient_normalizer.load_state_dict(state["hp_gradient_normalizer"])
 
     @torch.no_grad()
     def _gather_grads(self, part):
