@@ -567,7 +567,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     actual_weights = self._normalize_weights(actual_weights)
                 else:
                     equal_norm = pretrain_covariances.detach().sum().sqrt()
-                    actual_weights = solve_qcqp(C, -b, positive=positive) * equal_norm
+                    actual_weights = solve_qcqp(C, -b) * equal_norm
+                    if positive:
+                        # More stable than solve_qcqp(..., positive=True).
+                        actual_weights = actual_weights.clip(min=0)
             else:
                 assert self.algorithm == "none"
                 actual_weights = torch.ones_like(logits)
