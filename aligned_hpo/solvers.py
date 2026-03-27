@@ -40,7 +40,7 @@ def solve_qp(C, b, method="cvxopt", eps=1e-6, maxiters=100,
     return torch.from_numpy(weights).to(dtype=dtype, device=device)
 
 
-def solve_nonnegative_qcqp(C, b, tol=1e-12, max_iter=100):
+def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
     """Solve:
 
         maximize    b^T x
@@ -55,6 +55,13 @@ def solve_nonnegative_qcqp(C, b, tol=1e-12, max_iter=100):
     C = C.cpu().double().numpy()
     b = b.cpu().double().numpy()
 
+    if not positive:
+        # Closed-form solution.
+        y = np.linalg.pinv(CS) @ bS
+        prod = np.linalg.lstsq(C, b)[0]
+        x = prod / ((b @ prod) ** 0.5 + 1e-12)
+        return torch.from_numpy(x).to(dtype=dtype, device=device)
+
     # initial support
     S = set(np.where(b > 0)[0])
     if not S:
@@ -67,7 +74,7 @@ def solve_nonnegative_qcqp(C, b, tol=1e-12, max_iter=100):
         bS = b[S_list]
 
         # reduced solve
-        y = np.linalg.solve(CS, bS)
+        y = np.linalg.lstsq(CS, bS)[0]
 
         # remove nonpositive components
         keep = y > tol
