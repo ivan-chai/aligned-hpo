@@ -40,7 +40,7 @@ def solve_qp(C, b, method="cvxopt", eps=1e-6, maxiters=100,
     return torch.from_numpy(weights).to(dtype=dtype, device=device)
 
 
-def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
+def solve_qcqp(C, b, positive=False, tol=1e-12, rcond=1e-8, max_iter=100):
     """Solve:
 
         maximize    b^T x
@@ -57,7 +57,7 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
 
     if not positive:
         # Closed-form solution.
-        prod = np.linalg.lstsq(C, b)[0]
+        prod = np.linalg.lstsq(C, b, rcond=rcond)[0]
         norm2 = b @ prod
         if norm2 < 0:
             x = np.zeros_like(b)
@@ -77,7 +77,7 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
         bS = b[S_list]
 
         # reduced solve
-        y = np.linalg.lstsq(CS, bS)[0]
+        y = np.linalg.lstsq(CS, bS, rcond=rcond)[0]
 
         # remove nonpositive components
         keep = y > tol
