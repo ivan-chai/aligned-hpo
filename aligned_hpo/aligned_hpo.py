@@ -498,7 +498,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     pretrain_covariances = all_grads @ all_grads.T
 
             if self.algorithm == "sgd":
-                self._buffers["correlations"] = products.detach()
+                self._buffers["correlations"] = products.detach().clone()
                 with torch.enable_grad():
                     actual_weights = self._normalize_weights(self.unnormalized_weights, pretrain_covariances=pretrain_covariances)
 
@@ -510,7 +510,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                         logits.grad *= self.clip_hp_grad / (grad_norm + self.eps)
             elif self.algorithm in {"dot", "dot-raw"}:
                 b = all_grads @ torch.nn.functional.normalize(down_grads, dim=0)  # (W).
-                self._buffers["correlations"] = b.detach()
+                self._buffers["correlations"] = b.detach().clone()
                 b = self._update_grads_cache(b, stage="correlations")
                 if self.algorithm == "dot":
                     if (self.weights_parametrization != "abs") or (self.weights_normalization != "sum"):
@@ -549,7 +549,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     C = C + jacobian_norm * self._grads_cache["z_C"]
                     b = b + jacobian_norm * self._grads_cache["z_b"]
 
-                self._buffers["correlations"] = -b.detach()
+                self._buffers["correlations"] = -b.detach().clone()
 
                 if self.algorithm == "expected-error":
                     all_grads_covs = [self._grads_cache[f"cov_{i}"] for i in range(self.n_weights)]
@@ -578,18 +578,18 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     self._buffers["ema_correlations"] *= self.cov_momentum
                     self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
                 else:
-                    self._buffers["avg_correlations"] = self._buffers["correlations"]
-                    self._buffers["ema_correlations"] = self._buffers["correlations"]
+                    self._buffers["avg_correlations"] = self._buffers["correlations"].clone()
+                    self._buffers["ema_correlations"] = self._buffers["correlations"].clone()
 
-            self._buffers["weights"] = actual_weights.detach()
+            self._buffers["weights"] = actual_weights.detach().clone()
             if n_updates > 1:
                 self._buffers["avg_weights"] *= (n_updates - 1) / n_updates
                 self._buffers["avg_weights"] += self._buffers["weights"] / n_updates
                 self._buffers["ema_weights"] *= self.cov_momentum
                 self._buffers["ema_weights"] += (1 - self.cov_momentum) * self._buffers["weights"]
             else:
-                self._buffers["avg_weights"] = self._buffers["weights"]
-                self._buffers["ema_weights"] = self._buffers["weights"]
+                self._buffers["avg_weights"] = self._buffers["weights"].clone()
+                self._buffers["ema_weights"] = self._buffers["weights"].clone()
 
             # Set hyperparameters and their grads.
             if self.algorithm == "sgd":
@@ -708,10 +708,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._buffers.update({k: (v.to(device=p.device, dtype=p.dtype) if isinstance(v, torch.Tensor) else v)
                               for k, v in state_dict.get("buffers", {}).items()})
         if self.apply_gradient_normalizer:
-             self.heads_gradient_normalizer.load_state_dict(state["heads_gradient_normalizer"])
-             self.shared_gradient_normalizer.load_state_dict(state["shared_gradient_normalizer"])
+             self.heads_gradient_normalizer.load_state_dict(state_dict["heads_gradient_normalizer"])
+             self.shared_gradient_normalizer.load_state_dict(state_dict["shared_gradient_normalizer"])
         if self.algorithm == "sgd":
-             self.hp_gradient_normalizer.load_state_dict(state["hp_gradient_normalizer"])
+             self.hp_gradient_normalizer.load_state_dict(state_dict["hp_gradient_normalizer"])
 
     @torch.no_grad()
     def _gather_grads(self, part):
