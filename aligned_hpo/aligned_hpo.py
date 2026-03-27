@@ -605,6 +605,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     # Synchronize weights.
                     torch.distributed.all_reduce(actual_weights, op=torch.distributed.ReduceOp.SUM)
                     actual_weights /= torch.distributed.get_world_size()
+                logits.copy_(actual_weights)
                 logits.grad = None
 
             if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(actual_weights) < self.eps):
