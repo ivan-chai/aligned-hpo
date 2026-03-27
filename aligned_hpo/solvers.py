@@ -57,7 +57,6 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
 
     if not positive:
         # Closed-form solution.
-        y = np.linalg.pinv(CS) @ bS
         prod = np.linalg.lstsq(C, b)[0]
         x = prod / ((b @ prod) ** 0.5 + 1e-12)
         return torch.from_numpy(x).to(dtype=dtype, device=device)
