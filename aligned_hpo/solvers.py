@@ -58,7 +58,11 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
     if not positive:
         # Closed-form solution.
         prod = np.linalg.lstsq(C, b)[0]
-        x = prod / ((b @ prod) ** 0.5 + 1e-12)
+        norm2 = b @ prod
+        if norm2 < 0:
+            x = np.zeros_like(b)
+        else:
+            x = prod / (norm2 ** 0.5 + 1e-12)
         return torch.from_numpy(x).to(dtype=dtype, device=device)
 
     # initial support
@@ -81,7 +85,11 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, max_iter=100):
             S = {S_list[i] for i in range(len(S_list)) if keep[i]}
             continue
 
-        denom = np.sqrt(bS @ y)
+        norm2 = bS @ y
+        if norm2 < 0:
+            x = np.zeros_like(b)
+            break
+        denom = np.sqrt(norm2) + 1e-12
         x = np.zeros(n)
         x[S_list] = y / denom
 
