@@ -9,7 +9,7 @@ from copy import deepcopy
 from numbers import Number
 
 from .gradient import GradientNormalizer, RescaleWeights
-from .solvers import solve_qp
+from .solvers import solve_qp, solve_nonnegative_qcqp
 
 
 HPO_STAGE_DOWNSTREAM = "downstream"
@@ -561,9 +561,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 else:
                     assert self.algorithm == "mse"
 
-                actual_weights = solve_qp(C, b, positive=positive,
-                                          maxiters=self.maxiters, eps=self.eps)
-                actual_weights = self._normalize_weights(actual_weights, pretrain_covariances=pretrain_covariances)
+                if self.weights_normalization != "grad-norm":
+                    actual_weights = solve_qp(C, b, positive=positive,
+                                              maxiters=self.maxiters, eps=self.eps)
+                    actual_weights = self._normalize_weights(actual_weights)
+                else:
+                    if not positive:
+                        raise NotImplementedError("MSE with grad-norm and without positive constraint")
+                    equal_norm = pretrain_covariances.detach().sum().sqrt()
+                    actual_weights = solve_nonnegative_qcqp(C, -b) * equal_norm
             else:
                 assert self.algorithm == "none"
                 actual_weights = torch.ones_like(logits)
