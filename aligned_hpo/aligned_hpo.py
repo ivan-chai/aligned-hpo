@@ -304,9 +304,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         else:
             assert isinstance(stage, Number)
             momentum = self.main_momentum
-        if momentum == 0:
-            return grads
-        elif self._grads_cache[stage] is None:
+        # TODO: Don't store gradients if momentum = 0.
+        if self._grads_cache[stage] is None:
             self._grads_cache[stage] = grads
         else:
             if momentum > 0:
@@ -317,8 +316,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     @torch.no_grad()
     def _get_loss_grads(self, closure):
         """Update weights (gradient or value) and return cached gradients."""
-        logits = self.logits
-        loss_weights = torch.zeros_like(logits)
+        loss_weights = torch.zeros_like(self.logits)
 
         # Below:
         # - heads grads: individual heads weights gradients.
