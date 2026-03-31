@@ -5,6 +5,7 @@ import re
 import scipy.optimize
 import torch
 import warnings
+from contextlib import contextmanager
 from copy import deepcopy
 from numbers import Number
 
@@ -116,7 +117,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  encoder_decoder=False, algorithm="sgd", ema=0, align="train",
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
                  skip_step_zero_weights_limit=5, hp_simple_gd=True, clip_hp_grad=None,
-                 maxiters=100, eps=1e-6):
+                 z_grad_lr=0.001, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         params = list(params)
@@ -182,6 +183,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self.hp_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.stats_momentum)
         self.hp_simple_gd = hp_simple_gd
         self.clip_hp_grad = clip_hp_grad
+        self.z_grad_lr = z_grad_lr
         self.maxiters = maxiters
         self.eps = eps
 
@@ -189,7 +191,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._grads_cache = {HPO_STAGE_DOWNSTREAM: None, "weights": None} | {i: None for i in range(self.n_weights)}
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
-            if self.align == "train-val":
+            if (self.align == "train-val") and self.encoder_decoder:
                 self._grads_cache["encoder"] = None
         self._buffers = {
             "n_skipped_steps": 0,
@@ -330,8 +332,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.encoder_decoder and (z_down is None or z_down.grad is None):
             raise TypeError("In the encoder-decoder mode, closure must return embedding with gradient.")
         if self.encoder_decoder:
-            z_down_grads = z_down.grad.flatten()
-            z_down = z_down.data.clone()
+            z_down_grads = z_down.grad.flatten().clone()
+            z_down = z_down.clone()
         heads_down_grads = self._gather_grads("heads")
         shared_down_grads = self._gather_grads("shared")
 
@@ -388,18 +390,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.apply_optimizer_correction_("shared", down_grads)
             if self.encoder_decoder:
                 # Estimate z gradient on the current batch.
-                raise NotImplementedError("TODO: estimate Z gradient on the batch given encoder model")
-                if embed_fn is not None:
+                if embed_fn is None:
                     raise ValueError("Need embed_fn for train-val alignment in encoder_decoder mode")
-                encoder_lr = 0.001
                 encoder_down_grads = self._grads_cache["encoder"]
                 if self.apply_optimizer_correction:
                     encoder_down_grads = encoder_down_grads.clone()
                     self.apply_optimizer_correction_("encoder", encoder_down_grads)
-                with self.cached_encoder_state():
-                    self._make_encoder_step(encoder_down_grads, lr=encoder_lr)
+                with self._tmp_encoder_update(encoder_down_grads, lr=self.z_grad_lr):
                     z_down_after = embed_fn()
-                z_grad = (grads["z_down"] - z_down_after) / lr
+                z_grad = (grads["z_down"] - z_down_after) / self.z_grad_lr
                 down_grads = torch.cat([z_grad.flatten(), down_grads])
 
         # Caches for normalization differentiation.
@@ -486,9 +485,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._buffers["avg_weights"] = self._buffers["weights"].clone()
             self._buffers["ema_weights"] = self._buffers["weights"].clone()
 
-        return grads
+        return grads | {"all_grads_covs": all_grads_covs}
 
-    def val_step(self, closure, embed_fn=None, after_backward_hook=None):
+    @torch.no_grad()
+    def val_step(self, closure, closure_encoder=None, embed_fn=None, after_backward_hook=None):
         """Make a single step on a validation set to cache downstream grads and (optionally) update downstream head.
 
         Args:
@@ -508,24 +508,28 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 warnings.warn("Calling val_step, when align is `train`.")
             return
         assert closure is not None, "need closure"
-
-        if self.align == "train-val":
-            # Cache encoder and shared grads.
-            downstream_weight = 1
-            loss_weights = torch.zeros_like(self.logits)
-            torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
-            self._update_grads_cache(self._gather_grads("shared"), stage=HPO_STAGE_DOWNSTREAM)
-            self._update_grads_cache(self._gather_grads("encoder"), stage="encoder")
-            return
-
-        # Tune weights.
-        assert self.align == "val"
         closure = torch.enable_grad()(closure)  # The closure should do a full forward-backward pass.
         if self.encoder_decoder:
             if closure_encoder is None:
                 raise ValueError("Need encoder closure.")
             closure_encoder = torch.enable_grad()(closure_encoder)  # The closure should do a full forward-backward pass.
 
+        if self.align == "train-val":
+            # Cache encoder and shared grads.
+            downstream_weight = 1
+            loss_weights = torch.zeros_like(self.logits)
+            z_down = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
+            self._update_grads_cache(self._gather_grads("shared"), stage=HPO_STAGE_DOWNSTREAM)
+            if self.encoder_decoder:
+                closure_encoder(z_down.grad.flatten())
+                encoder_grads = self._gather_grads("encoder")
+                if torch.linalg.norm(encoder_grads) == 0:
+                    raise RuntimeError("Zero-norm encoder gradient")
+                self._update_grads_cache(encoder_grads, stage="encoder")
+            return
+
+        # Tune weights.
+        assert self.align == "val"
         output_weights = torch.empty_like(self.logits)
 
         @torch.no_grad()
@@ -556,6 +560,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             inner_closure()
         return output_weights
 
+    @torch.no_grad()
     def hpo_step(self, closure, closure_encoder=None, embed_fn=None, after_backward_hook=None):
         """Make a single step.
 
@@ -593,7 +598,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
                 if not skip_step:
-                    weights = self._normalize_weights(torch.ones_like(weights), pretrain_covariances=pretrain_covariances)
+                    weights = self._normalize_weights(torch.ones_like(weights), pretrain_covariances=grads.get("all_grads_covs", None))
             else:
                 skip_step = False
                 self._buffers["n_skipped_steps"] = 0
@@ -676,6 +681,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         except ZeroWeightsException:
             pass
         return output_weights
+
+    @contextmanager
+    def _tmp_encoder_update(self, grads, lr):
+        """Save encoder parameters on entry and restore them on exit."""
+        encoder_params = [p for group in self.param_groups[3:] for p in group["params"]]
+        saved = [p.data.clone() for p in encoder_params]
+        try:
+            offset = 0
+            for p in encoder_params:
+                numel = p.numel()
+                p.data.copy_(p.data - lr * grads[offset:offset + numel].reshape(p.shape))
+                offset += numel
+            assert offset == len(grads)
+            yield
+        finally:
+            for p, saved_data in zip(encoder_params, saved):
+                p.data.copy_(saved_data)
 
     def state_dict(self):
         state = self.base_optimizer.state_dict()
