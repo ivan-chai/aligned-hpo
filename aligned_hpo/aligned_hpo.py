@@ -176,10 +176,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.apply_optimizer_correction = apply_optimizer_correction
         self.apply_gradient_normalizer = apply_gradient_normalizer
         if apply_gradient_normalizer:
-            self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
-            self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.cov_momentum)
+            self.heads_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.stats_momentum)
+            self.shared_gradient_normalizer = GradientNormalizer(clip=1e-6, momentum=self.stats_momentum)
         if algorithm == "sgd":
-            self.hp_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.cov_momentum)
+            self.hp_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.stats_momentum)
         self.hp_simple_gd = hp_simple_gd
         self.clip_hp_grad = clip_hp_grad
         self.maxiters = maxiters
@@ -205,17 +205,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._buffers["avg_correlations"] = None
 
     @property
-    def logits(self):
-        return self.param_groups[0]["params"][0]
-
-    @property
     def use_validation(self):
         return self.align != "train"
 
-    def step(self, closure=None, *, inner=False):
-        if not inner:
-            raise ValueError("Please, use 'hpo_step' function.")
-        self.base_optimizer.step(closure=closure)
+    @property
+    def logits(self):
+        return self.param_groups[0]["params"][0]
 
     @property
     def metrics(self):
@@ -247,6 +242,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if not self.hp_gradient_normalizer.is_first:
                 result["hp_gradient_moving_norm"] = self.hp_gradient_normalizer.moving_norm
         return result
+
+    def step(self, closure=None, *, inner=False):
+        if not inner:
+            raise ValueError("Please, use 'hpo_step' function.")
+        self.base_optimizer.step(closure=closure)
 
     @property
     def _unnormalized_weights(self):
@@ -314,7 +314,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return self._grads_cache[stage]
 
     @torch.no_grad()
-    def _get_grads(self, closure):
+    def _get_loss_grads(self, closure):
         """Update weights (gradient or value) and return cached gradients."""
         logits = self.logits
         loss_weights = torch.zeros_like(logits)
@@ -619,7 +619,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         @torch.no_grad()
         def inner_closure():
             if self.align == "val":
-                grads = self._get_grads(closure)
+                grads = self._get_loss_grads(closure)
             else:
                 grads = self._tune_weights(closure, embed_fn=embed_fn)
             weights = self._grads_cache["weights"]
