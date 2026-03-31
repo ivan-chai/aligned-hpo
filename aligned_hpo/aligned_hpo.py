@@ -15,7 +15,7 @@ from .solvers import solve_qp, solve_qcqp
 HPO_STAGE_DOWNSTREAM = "downstream"
 
 
-DEFAULT_EMA_COV = 0.9
+DEFAULT_EMA_STATS = 0.9
 
 
 class ZeroWeightsException(Exception):
@@ -39,8 +39,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
-        ema: Use momentum for gradient smoothing. Can be a dictionary with "cov", "main", "downstream", "z", and "weights" keys. See notes below.
-        tune_on_val: Whether validation batches will be provided or not.
+        ema: Use momentum for gradient smoothing. Can be a dictionary with "downstream", "main", "weights", and "stats" keys. See notes below.
+        align: Either `train` to tune weights on the train set only, `val`, or `train-val` to align training gradients with validation downstream grad.
         apply_gradient_normalizer: Normalize gradients using running statistics.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         hp_simple_gd: Use simple gradient descent for the weights.
@@ -50,12 +50,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     NOTE. Exponential Moving Average (EMA)
 
     There are multiple smoothing techinques that help to reduce overfitting on the val set.
-    Two main parameters: "main" and "downstream", that control smoothing of the pretraining and downstream gradients respectivelly.
+    Three main parameters: "downstream", "main", and "weights", that control smoothing of the pretraining and downstream gradients respectivelly.
     There are some additional smoothing parameters:
-    - "cov" can be used to control covariances estimation smoothing. By default, "cov" smoothing is equal to DEFAULT_EMA_COV otherwise.
-    - "z" controlls smoothing of the covariances, computed for embedding in the encoder-decoder mode. By default, "z" smoothing is equal to "downstream".
-    - "weights" controlls smoothing of weights between batches. It is zero by default.
-    - "jacobian" controlls smoothing of the Jacobian norm estimate. By default it is equal to main.
+    - "stats" can be used to control covariances estimation smoothing. By default, "stats" smoothing is equal to DEFAULT_EMA_STATS otherwise.
 
     NOTE. Encoder-Decoder vs full gradients.
 
@@ -104,7 +101,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         z.grad = None  # New.
         loss = down_weight * down_loss + weights[0] * loss1 + weights[1] * loss2
         loss.backward(retain_graph=retain_graph)
-        return z.grad  # New.
+        return z  # New.
 
     def closure_encoder(z_grad):
         optimizer.zero_grad()
@@ -114,9 +111,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     ```
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
-                 weights_parametrization="abs", weights_normalization="grad-norm",
+                 weights_parametrization="abs", weights_normalization="grad-norm-scaled",
                  encoder_downstream_weight=0, shared_downstream_weight=0, downstream_merge=False,
-                 encoder_decoder=False, algorithm="sgd", ema=None, tune_on_val=False,
+                 encoder_decoder=False, algorithm="sgd", ema=0, align="train",
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
                  skip_step_zero_weights_limit=5, hp_simple_gd=True, clip_hp_grad=None,
                  maxiters=100, eps=1e-6):
@@ -127,19 +124,21 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, second group being projectin heads weights, and third group being encoder weights.")
         if (len(params[0]["params"]) != 1) or (params[0]["params"][0].ndim != 1):
             raise ValueError("Weights must be flat.")
-        if algorithm not in {"sgd", "dot", "dot-raw", "mse", "expected-error", "none"}:
+        if algorithm not in {"sgd", "mse", "none"}:
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
-        if weights_normalization not in ["sum", "norm", "grad-norm", "none"] and not isinstance(weights_normalization, Number):
+        if weights_normalization not in ["sum", "norm", "grad-norm", "grad-norm-scaled", "none"] and not isinstance(weights_normalization, Number):
             raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
+        if align not in ["train", "val", "train-val"]:
+            raise ValueError(f"Unknown align mode: {align}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
         self.base_optimizer = base_optimizer_cls(self.param_groups, **(base_optimizer_params or {}))
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
 
-        self.n_weights = len(self.param_groups[0]["params"][0])
+        self.n_weights = len(self.logits)
         if weights_names is None:
             weights_names = [str(i) for i in range(self.n_weights)]
         elif len(weights_names) != self.n_weights:
@@ -154,33 +153,25 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
+        self.align = align
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
 
-        if ema is None:
-            ema = {"main": 0, "downstream": 0}
-        elif isinstance(ema, Number):
-            ema = {k: ema for k in ["main", "downstream"]}
-        elif ("main" not in ema) or ("downstream" not in ema):
-            raise ValueError(f"ema: expected dictionary with 'main', 'downstream' and optional 'cov' keys.")
-        if "cov" not in ema:
-            ema["cov"] = DEFAULT_EMA_COV
-        if "z" not in ema:
-            ema["z"] = ema["downstream"]
-        if "weights" not in ema:
-            ema["weights"] = 0
-        if "jacobian" not in ema:
-            ema["jacobian"] = ema["main"]
-        unknown_keys = set(ema) - {"main", "downstream", "z", "cov", "weights", "jacobian"}
+        if isinstance(ema, Number):
+            ema = {k: ema for k in ["downstream", "main", "weights"]}
+        ema_defaults = {
+            "downstream": 0,
+            "main": 0,
+            "weights": 0,
+            "stats": DEFAULT_EMA_STATS
+        }
+        ema = dict(ema_defaults, **ema)
+        unknown_keys = set(ema) - {"downstream", "main", "weights", "stats"}
         if unknown_keys:
             raise ValueError(f"Unknown EMA keys: {unknown_keys}")
         self.downstream_momentum = ema["downstream"]
         self.main_momentum = ema["main"]
-        self.cov_momentum = ema["cov"]
-        self.z_momentum = ema["z"]
         self.weights_momentum = ema["weights"]
-        self.jacobian_momentum = ema["jacobian"]
-
-        self.tune_on_val = tune_on_val
+        self.stats_momentum = ema["stats"]
 
         self.apply_optimizer_correction = apply_optimizer_correction
         self.apply_gradient_normalizer = apply_gradient_normalizer
@@ -195,16 +186,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.eps = eps
 
         # TODO: use optimizer state for gradient caches.
-        self._grads_cache = {HPO_STAGE_DOWNSTREAM: None} | {i: None for i in range(self.n_weights)}
-        if tune_on_val and (self.algorithm not in {"sgd", "none"}):
-            self._grads_cache.update({"z_C": None, "z_b": None})
-        if algorithm == "expected-error":
-            self._grads_cache.update({f"cov_{i}": None for i in range(self.n_weights)})
-        if algorithm in {"dot", "dot-raw"}:
-            self._grads_cache.update({f"correlations": None})
+        self._grads_cache = {HPO_STAGE_DOWNSTREAM: None, "weights": None} | {i: None for i in range(self.n_weights)}
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
-        self._grads_cache["weights"] = None
+            if self.align == "train-val":
+                self._grads_cache["encoder"] = None
         self._buffers = {
             "n_skipped_steps": 0,
             "n_updates": 0,
@@ -219,79 +205,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._buffers["avg_correlations"] = None
 
     @property
-    def unnormalized_weights(self):
-        logits = self.param_groups[0]["params"][0]
-        if self.weights_parametrization == "abs":
-            weights = torch.abs(logits)
-        elif self.weights_parametrization == "linear":
-            weights = logits
-        else:
-            raise RuntimeError(f"Unknown parametrization: {self.weights_parametrization}")
-        return weights
+    def logits(self):
+        return self.param_groups[0]["params"][0]
+
+    @property
+    def need_validation(self):
+        return self.align != "train"
 
     def step(self, closure=None, *, inner=False):
         if not inner:
             raise ValueError("Please, use 'hpo_step' function.")
         self.base_optimizer.step(closure=closure)
 
-    def _update_grads_cache_impl(self, key, value, momentum=0):
-        if self._grads_cache[key] is None:
-            self._grads_cache[key] = value
-        else:
-            if momentum > 0:
-                value = self._grads_cache[key] * momentum + value * (1 - momentum)
-            self._grads_cache[key] = value
-
-    def _update_grads_cache(self, grads, stage=None):
-        return_smoothed = True
-        if stage not in self._grads_cache:
-            raise ValueError(f"Unknown stage: {stage}")
-        if stage == HPO_STAGE_DOWNSTREAM:
-            momentum = self.downstream_momentum
-        elif stage in {"z_C", "z_b"}:
-            momentum = self.z_momentum
-        elif stage == "weights":
-            momentum = self.weights_momentum
-        elif stage == "jacobian":
-            momentum = self.jacobian_momentum
-        elif stage == "correlations":
-            momentum = self.cov_momentum
-        else:
-            assert isinstance(stage, Number)
-            momentum = self.main_momentum
-            if (momentum == 0) and (self.algorithm == "expected-error"):
-                # Smooth covariance estimation, but not the value.
-                momentum = self.cov_momentum
-                return_smoothed = False
-
-        # Update covs.
-        cov_key = f"cov_{stage}"
-        if (self.algorithm == "expected-error") and (cov_key in self._grads_cache):
-            if self._grads_cache[stage] is not None:
-                delta = grads - self._grads_cache[stage]
-                delta_sq = torch.linalg.norm(delta).square()
-            else:
-                delta_sq = torch.zeros([], dtype=grads.dtype, device=grads.device)
-            self._update_grads_cache_impl(cov_key, delta_sq, momentum=self.cov_momentum)
-
-        # Update means.
-        self._update_grads_cache_impl(stage, grads, momentum=momentum)
-        if return_smoothed:
-            return self._grads_cache[stage]
-        else:
-            return grads
-
     @property
     def metrics(self):
         result = {}
-        for name, c in zip(self.weights_names, self.param_groups[0]["params"][0]):
+        for name, c in zip(self.weights_names, self.logits):
             result[f"logits_{name}"] = c
-        for k, v in self._grads_cache.items():
-            if not isinstance(k, int) and k.startswith("cov_") and (v is not None):
-                res = re.match(r"cov_([0-9]+)", k)
-                if res:
-                    k = f"cov_{self.weights_names[int(res.group(1))]}"
-                result[k] = v.mean().item()
         if self._grads_cache.get("jacobian", None) is not None:
             result["jacobian_norm"] = self._grads_cache["jacobian"]
         if (self.algorithm not in {"none"}) and (self._buffers["correlations"] is not None):
@@ -318,6 +248,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result["hp_gradient_moving_norm"] = self.hp_gradient_normalizer.moving_norm
         return result
 
+    @property
+    def _unnormalized_weights(self):
+        if self.weights_parametrization == "abs":
+            weights = torch.abs(self.logits)
+        elif self.weights_parametrization == "linear":
+            weights = self.logits
+        else:
+            raise RuntimeError(f"Unknown parametrization: {self.weights_parametrization}")
+        return weights
+
     def _normalize_weights(self, weights, pretrain_covariances=None):
         if torch.linalg.norm(weights) < self.eps:
             return weights
@@ -327,11 +267,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return self.n_weights * weights / (weights.sum() + self.eps)
         elif self.weights_normalization == "norm":
             return math.sqrt(self.n_weights) * weights / (torch.linalg.norm(weights) + self.eps)
-        elif self.weights_normalization == "grad-norm":
+        elif self.weights_normalization in {"grad-norm", "grad-norm-scaled"}:
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
             pretrain_covariances = pretrain_covariances.detach()
-            equal_norm = pretrain_covariances.sum().sqrt()
+            # Scale to the gradient norm of equal weights.
+            target_norm = pretrain_covariances.sum().sqrt() if self.weights_normalization == "grad-norm-scaled" else 1
 
             # Scale weights and covariances.
             scales = torch.diag(pretrain_covariances).sqrt()  # (W).
@@ -341,7 +282,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Normalize.
             norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
             weights = weights / (norm + 1e-12)
-            weights = weights * equal_norm  # Same norm as for equal weights.
+            weights = weights * target_norm
 
             # Unscale.
             weights = weights / (scales + 1e-12)
@@ -350,7 +291,239 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             assert self.weights_normalization == "none"
             return weights
 
-    def val_step(self, closure, after_backward_hook=None):
+    def _update_grads_cache(self, grads, stage=None):
+        return_smoothed = True
+        if stage not in self._grads_cache:
+            raise ValueError(f"Unknown stage: {stage}")
+        if stage in {HPO_STAGE_DOWNSTREAM, "encoder"}:
+            momentum = self.downstream_momentum
+        elif stage == "weights":
+            momentum = self.weights_momentum
+        elif stage in {"jacobian"}:
+            momentum = self.stats_momentum
+        else:
+            assert isinstance(stage, Number)
+            momentum = self.main_momentum
+
+        if self._grads_cache[stage] is None:
+            self._grads_cache[stage] = value
+        else:
+            if momentum > 0:
+                value = self._grads_cache[stage] * momentum + value * (1 - momentum)
+            self._grads_cache[stage] = value
+        return self._grads_cache[stage]
+
+    @torch.no_grad()
+    def _get_grads(self, closure):
+        """Update weights (gradient or value) and return cached gradients."""
+        logits = self.logits
+        loss_weights = torch.zeros_like(logits)
+
+        # Below:
+        # - heads grads: individual heads weights gradients.
+        # - z grads: gradient w.r.t. encoder output.
+        # - shared grads: shared decoder weights gradients before EMA.
+        # - grads: HPO grads after EMA smoothing used for weights tuning.
+
+        # Compute downstream grads.
+        downstream_weight = 1
+        z_down = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
+        if self.encoder_decoder and (z_down is None or z_down.grad is None):
+            raise TypeError("In the encoder-decoder mode, closure must return embedding with gradient.")
+        heads_down_grads = self._gather_grads("heads")
+        shared_down_grads = self._gather_grads("shared")
+
+        # Caches for normalization differentiation.
+        all_z_grads = []
+        all_heads_grads = []
+        all_shared_grads = []
+
+        # Compute main losses grads.
+        downstream_weight = 0
+        for i in range(self.n_weights):
+            loss_weights[i] = 1
+            z = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
+            loss_weights[i] = 0
+            if self.encoder_decoder and (z is None or z.grad is None):
+                raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
+            heads_grads = self._gather_grads("heads")
+            shared_grads = self._gather_grads("shared")
+            if self.encoder_decoder:
+                all_z_grads.append(z.grad)
+            all_heads_grads.append(heads_grads)
+            all_shared_grads.append(shared_grads)
+
+        return {
+            "heads_down_grads": heads_down_grads,
+            "shared_down_grads": shared_down_grads,
+            "z_down_grads": z_down.grad if z_down is not None else None,
+            "all_heads_grads": all_heads_grads,
+            "all_shared_grads": all_shared_grads,
+            "all_z_grads": all_z_grads,
+        }
+
+    @torch.no_grad()
+    def _tune_weights(self, closure, embed_fn=None):
+        """Update weights (gradient or value) and return cached gradients."""
+        logits = self.logits
+
+        self._buffers["n_updates"] += 1
+        n_updates = self._buffers["n_updates"]
+        self._buffers["correlations"] = None
+
+        loss_weights = torch.zeros_like(logits)
+
+        # Below:
+        # - heads grads: individual heads weights gradients.
+        # - z grads: gradient w.r.t. encoder output.
+        # - shared grads: shared decoder weights gradients before EMA.
+        # - grads: HPO grads after EMA smoothing used for weights tuning.
+
+        # Compute downstream grads.
+        downstream_weight = 1
+        z_down = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
+        if self.encoder_decoder and (z_down is None or z_down.grad is None):
+            raise TypeError("In the encoder-decoder mode, closure must return embedding with gradient.")
+        heads_down_grads = self._gather_grads("heads")
+        shared_down_grads = self._gather_grads("shared")
+
+        if self.align in {"train", "val"}:
+            # Downstream and pretrain gradients are computed on the same batch.
+            down_grads = self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
+            if self.apply_optimizer_correction:
+                down_grads = down_grads.clone()
+                self.apply_optimizer_correction_("shared", down_grads)
+            if self.encoder_decoder:
+                down_grads = torch.cat([z_down.grad.flatten(), down_grads])
+        else:
+            assert self.align == "train-val"
+            # Downstream and pretrain gradients are computed on different batches.
+            # Now we process a training batch.
+            down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
+            if self.apply_optimizer_correction:
+                down_grads = down_grads.clone()
+                self.apply_optimizer_correction_("shared", down_grads)
+            if self.encoder_decoder:
+                # Estimate z gradient on the current batch.
+                raise NotImplementedError("TODO: estimate Z gradient on the batch given encoder model")
+                if embed_fn is not None:
+                    raise ValueError("Need embed_fn for train-val alignment in encoder_decoder mode")
+                encoder_lr = 0.001
+                encoder_down_grads = self._grads_cache["encoder"]
+                if self.apply_optimizer_correction:
+                    encoder_down_grads = encoder_down_grads.clone()
+                    self.apply_optimizer_correction_("encoder", encoder_down_grads)
+                with self.cached_encoder_state():
+                    self._make_encoder_step(encoder_down_grads, lr=encoder_lr)
+                    z_down_after = embed_fn()
+                z_grad = (z_down - z_down_after) / lr
+                down_grads = torch.cat([z_grad.flatten(), down_grads])
+
+        # Caches for normalization differentiation.
+        all_grads = []
+        all_z_grads = []
+        all_heads_grads = []
+        all_shared_grads = []
+
+        # Compute main losses grads.
+        downstream_weight = 0
+        for i in range(self.n_weights):
+            loss_weights[i] = 1
+            z = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
+            loss_weights[i] = 0
+            if self.encoder_decoder and (z is None or z.grad is None):
+                raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
+            heads_grads = self._gather_grads("heads")
+            shared_grads = self._gather_grads("shared")
+            loss_grads = self._update_grads_cache(shared_grads, stage=i)
+            if self.apply_optimizer_correction:
+                loss_grads = loss_grads.clone()
+                self.apply_optimizer_correction_("shared", loss_grads)
+            loss_grads = torch.cat([z.grad, loss_grads]) if self.encoder_decoder else loss_grads
+            all_grads.append(loss_grads)
+            if self.encoder_decoder:
+                all_z_grads.append(z.grad)
+            all_heads_grads.append(heads_grads)
+            all_shared_grads.append(shared_grads)
+
+        all_grads = torch.stack(all_grads, 0)  # (W, P).
+        all_grads_covs = all_grads @ all_grads.T
+        products = all_grads @ down_grads  # (W).
+        self._buffers["correlations"] = products.detach().clone()
+
+        if self.algorithm == "sgd":
+            with torch.enable_grad():
+                weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+            logits.grad = None
+            weights.backward(-products)
+            if self.clip_hp_grad is not None:
+                grad_norm = torch.linalg.norm(logits.grad)
+                if grad_norm > self.clip_hp_grad:
+                    logits.grad *= self.clip_hp_grad / (grad_norm + self.eps)
+        elif self.algorithm == "mse":
+            if self.weights_parametrization == "abs":
+                positive = True
+            else:
+                assert self.weights_parametrization == "linear"
+                positive = False
+
+            if self.weights_normalization not in {"grad-norm", "grad-norm-scaled"}:
+                weights = solve_qp(all_grads_covs, -products, positive=positive,
+                                   maxiters=self.maxiters, eps=self.eps)
+                weights = self._normalize_weights(weights)
+            else:
+                equal_norm = all_grads_covs.detach().sum().sqrt()
+                weights = solve_qcqp(all_grads_covs, products) * equal_norm
+                if positive:
+                    # More stable than solve_qcqp(..., positive=True).
+                    weights = weights.clip(min=0)
+        else:
+            assert self.algorithm == "none"
+            weights = torch.ones_like(logits)
+            weights = self._normalize_weights(weights, pretrain_covariances=all_grads_covs)
+
+        # Set hyperparameters and their grads.
+        if self.algorithm == "sgd":
+            assert logits.grad is not None
+        else:
+            if torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1):
+                # Synchronize weights.
+                torch.distributed.all_reduce(weights, op=torch.distributed.ReduceOp.SUM)
+                weights /= torch.distributed.get_world_size()
+            logits.copy_(weights)
+            logits.grad = None
+
+        weights = self._update_grads_cache(weights, stage="weights")
+
+        if n_updates > 1:
+            self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
+            self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
+            self._buffers["ema_correlations"] *= self.stats_momentum
+            self._buffers["ema_correlations"] += (1 - self.stats_momentum) * self._buffers["correlations"]
+        else:
+            self._buffers["avg_correlations"] = self._buffers["correlations"].clone()
+            self._buffers["ema_correlations"] = self._buffers["correlations"].clone()
+
+        self._buffers["weights"] = weights.detach().clone()
+        if n_updates > 1:
+            self._buffers["avg_weights"] *= (n_updates - 1) / n_updates
+            self._buffers["avg_weights"] += self._buffers["weights"] / n_updates
+            self._buffers["ema_weights"] *= self.stats_momentum
+            self._buffers["ema_weights"] += (1 - self.stats_momentum) * self._buffers["weights"]
+        else:
+            self._buffers["avg_weights"] = self._buffers["weights"].clone()
+            self._buffers["ema_weights"] = self._buffers["weights"].clone()
+
+        return {
+            "heads_down_grads": heads_down_grads,
+            "shared_down_grads": shared_down_grads,
+            "z_down_grads": z_down.grad if z_down is not None else None,
+            "all_heads_grads": all_heads_grads,
+            "all_shared_grads": all_shared_grads,
+            "all_z_grads": all_z_grads,
+        }
+
+    def val_step(self, closure, embed_fn=None, after_backward_hook=None):
         """Make a single step on a validation set to cache downstream grads and (optionally) update downstream head.
 
         Args:
@@ -365,36 +538,60 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         Each closure must zero grads and compute gradients.
         """
-        if not self.tune_on_val:
+        if self.align == "train":
             if not torch.distributed.is_initialized() or (torch.distributed.get_rank() == 0):
-                warnings.warn("Calling val_step, when tune_on_val is disabled.")
+                warnings.warn("Calling val_step, when align is `train`.")
             return
         assert closure is not None, "need closure"
 
-        # Cache downstream shared grads.
-        downstream_weight = 1
-        loss_weights = torch.zeros_like(self.param_groups[0]["params"][0])
-        z_down_grads = torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
-        shared_down_grads = self._gather_grads("shared")
-        self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
+        if self.align == "train-val":
+            # Cache encoder and shared grads.
+            downstream_weight = 1
+            loss_weights = torch.zeros_like(self.logits)
+            torch.enable_grad()(closure)(downstream_weight, loss_weights, retain_graph=False, stage=HPO_STAGE_DOWNSTREAM)
+            self._update_grads_cache(self._gather_grads("shared"), stage=HPO_STAGE_DOWNSTREAM)
+            self._update_grads_cache(self._gather_grads("encoder"), stage="encoder")
+            return
 
-        if self.encoder_decoder and (self.algorithm not in {"sgd", "none"}):
-            # Cache embeddings covariances.
-            if z_down_grads is None:
-                raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-            downstream_weight = 0
-            all_z_grads = []
-            for i in range(self.n_weights):
-                loss_weights[i] = 1
-                all_z_grads.append(closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i))
-                loss_weights[i] = 0
-            all_z_grads = torch.stack(all_z_grads)  # (W, D).
-            C = all_z_grads @ all_z_grads.T
-            b = -(all_z_grads @ z_down_grads)  # (W).
-            self._update_grads_cache(C, stage="z_C")
-            self._update_grads_cache(b, stage="z_b")
+        # Tune weights.
+        assert self.align == "val"
+        closure = torch.enable_grad()(closure)  # The closure should do a full forward-backward pass.
+        if self.encoder_decoder:
+            if closure_encoder is None:
+                raise ValueError("Need encoder closure.")
+            closure_encoder = torch.enable_grad()(closure_encoder)  # The closure should do a full forward-backward pass.
 
-    def hpo_step(self, closure, closure_encoder=None, after_backward_hook=None):
+        output_weights = torch.empty_like(self.logits)
+
+        @torch.no_grad()
+        def inner_closure():
+            grads = self._tune_weights(closure, embed_fn=embed_fn)
+            weights = self._grads_cache["weights"]
+            output_weights.copy_(weights)
+
+            if self.algorithm == "sgd":
+                self.hp_gradient_normalizer([self.logits])
+
+            if after_backward_hook is not None:
+                after_backward_hook()
+
+            if self.algorithm == "sgd":
+                logits_grads.copy_(self.logits.grad)
+        if (self.algorithm == "sgd") and self.hp_simple_gd:
+            inner_closure()
+            lr = self.param_groups[0].get("lr", self.defaults.get("lr", None))
+            with torch.no_grad():
+                self.logits.add_(- lr * self.logits.grad)
+        elif self.algorithm == "sgd":
+            # Use optimizer.
+            self.step(inner_closure, inner=True)
+        else:
+            # Closed-form computation.
+            assert self.algorithm in {"mse", "none"}
+            inner_closure()
+        return output_weights
+
+    def hpo_step(self, closure, closure_encoder=None, embed_fn=None, after_backward_hook=None):
         """Make a single step.
 
         Args:
@@ -416,219 +613,37 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 raise ValueError("Need encoder closure.")
             closure_encoder = torch.enable_grad()(closure_encoder)  # The closure should do a full forward-backward pass.
 
-        output_weights = torch.empty_like(self.param_groups[0]["params"][0])
-        logits_grads = torch.empty_like(self.param_groups[0]["params"][0])
+        output_weights = torch.empty_like(self.logits)
+        logits_grads = torch.empty_like(self.logits)
 
         @torch.no_grad()
         def inner_closure():
-            logits = self.param_groups[0]["params"][0]
-
-            self._buffers["n_updates"] += 1
-            n_updates = self._buffers["n_updates"]
-            self._buffers["correlations"] = None
-
-            loss_weights = torch.zeros_like(logits)
-
-            # Below:
-            # - heads grads: individual heads weights gradients.
-            # - z grads: gradient w.r.t. encoder output.
-            # - shared grads: shared decoder weights gradients before EMA.
-            # - grads: HPO grads after EMA smoothing used for weights tuning.
-
-            # Compute downstream grads.
-            downstream_weight = 1
-            z_down_grads = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
-            if self.encoder_decoder and (z_down_grads is None):
-                raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-            heads_down_grads = self._gather_grads("heads")
-            shared_down_grads = self._gather_grads("shared")
-
-            if self.tune_on_val:
-                down_grads = self._grads_cache[HPO_STAGE_DOWNSTREAM]
+            if self.align == "val":
+                grads = self._get_grads(closure)
             else:
-                down_grads = self._update_grads_cache(shared_down_grads, stage=HPO_STAGE_DOWNSTREAM)
-            if self.apply_optimizer_correction:
-                down_grads = down_grads.clone()
-                self.apply_optimizer_correction_("shared", down_grads)
-            if self.encoder_decoder and not self.tune_on_val:
-                down_grads = torch.cat([z_down_grads, down_grads])
+                grads = self._tune_weights(closure, embed_fn=embed_fn)
+            weights = self._grads_cache["weights"]
 
-            # Caches for normalization differentiation.
-            compute_products = self.algorithm in {"sgd"}
-            if compute_products:
-                products = torch.zeros(self.n_weights, dtype=down_grads[0].dtype, device=down_grads[0].device)
-            store_all_grads = (self.algorithm in {"dot", "dot-raw", "mse", "expected-error"}) or (self.weights_normalization == "grad-norm")
-            if store_all_grads:
-                all_grads = []
-            store_z_grads = self.encoder_decoder
-            if store_z_grads:
-                all_z_grads = []
-            all_heads_grads = []
-            all_shared_grads = []
-
-            # Compute main losses grads.
-            downstream_weight = 0
-            for i in range(self.n_weights):
-                loss_weights[i] = 1
-                z_grads = closure(downstream_weight, loss_weights, retain_graph=(i < self.n_weights - 1), stage=i)
-                loss_weights[i] = 0
-                if self.encoder_decoder and (z_grads is None):
-                    raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
-                heads_grads = self._gather_grads("heads")
-                shared_grads = self._gather_grads("shared")
-                loss_grads = self._update_grads_cache(shared_grads, stage=i)
-                if self.apply_optimizer_correction:
-                    loss_grads = loss_grads.clone()
-                    self.apply_optimizer_correction_("shared", loss_grads)
-                loss_grads = torch.cat([z_grads, loss_grads]) if self.encoder_decoder and not self.tune_on_val else loss_grads
-                if compute_products:
-                    products[i] = down_grads @ loss_grads
-                if store_all_grads:
-                    all_grads.append(loss_grads)
-                if store_z_grads:
-                    all_z_grads.append(z_grads)
-                all_heads_grads.append(heads_grads)
-                all_shared_grads.append(shared_grads)
-
-            pretrain_covariances = None
-            if store_all_grads:
-                all_grads = torch.stack(all_grads, 0)  # (W, P).
-
-                if self.weights_normalization == "grad-norm":
-                    pretrain_covariances = all_grads @ all_grads.T
-
-            if self.algorithm == "sgd":
-                self._buffers["correlations"] = products.detach().clone()
-                with torch.enable_grad():
-                    actual_weights = self._normalize_weights(self.unnormalized_weights, pretrain_covariances=pretrain_covariances)
-
-                logits.grad = None
-                actual_weights.backward(-products)
-                if self.clip_hp_grad is not None:
-                    grad_norm = torch.linalg.norm(logits.grad)
-                    if grad_norm > self.clip_hp_grad:
-                        logits.grad *= self.clip_hp_grad / (grad_norm + self.eps)
-            elif self.algorithm in {"dot", "dot-raw"}:
-                b = all_grads @ torch.nn.functional.normalize(down_grads, dim=0)  # (W).
-                self._buffers["correlations"] = b.detach().clone()
-                b = self._update_grads_cache(b, stage="correlations")
-                if self.algorithm == "dot":
-                    if (self.weights_parametrization != "abs") or (self.weights_normalization != "sum"):
-                        raise NotImplementedError(f"{self.weights_parametrization} {self.weights_normalization}")
-                    actual_weights = torch.from_numpy(scipy.optimize.linprog(-b.float().cpu().numpy(), A_eq=np.ones([1, len(b)]), b_eq=np.ones([1])).x).float().to(b.device).to(b.dtype)
-                else:
-                    assert self.algorithm == "dot-raw"
-                    actual_weights = b
-                    if self.weights_parametrization == "abs":
-                        if (actual_weights < 0).all():
-                            actual_weights = torch.zeros_like(actual_weights)
-                        else:
-                            actual_weights = actual_weights.clip(min=0)
-                            actual_weights = actual_weights / actual_weights.sum()
-                    elif self.weights_parametrization == "none":
-                        pass
-                    else:
-                        raise NotImplementedError(self.weights_parametrization)
-                actual_weights = self._normalize_weights(actual_weights, pretrain_covariances=pretrain_covariances)
-            elif self.algorithm in {"mse", "expected-error"}:
-                if self.weights_parametrization == "abs":
-                    positive = True
-                else:
-                    assert self.weights_parametrization == "linear"
-                    positive = False
-
-                C = all_grads @ all_grads.T  # (W, W).
-                b = -(all_grads @ down_grads)  # (W).
-
-                if self.tune_on_val and self.encoder_decoder:
-                    jacobian_norm = self._grads_cache["jacobian"]
-                    if jacobian_norm is None:
-                        jacobian_norm = 1
-                    else:
-                        jacobian_norm = jacobian_norm.clip(min=self.eps)
-                    C = C + jacobian_norm * self._grads_cache["z_C"]
-                    b = b + jacobian_norm * self._grads_cache["z_b"]
-
-                self._buffers["correlations"] = -b.detach().clone()
-
-                if self.algorithm == "expected-error":
-                    all_grads_covs = [self._grads_cache[f"cov_{i}"] for i in range(self.n_weights)]
-                    if any([c is None for c in all_grads_covs]):
-                        all_grads_covs = torch.zeros_like(all_grads[:, 0])  # (W).
-                    else:
-                        all_grads_covs = torch.stack(all_grads_covs)  # (W).
-                    C = C + torch.diag(all_grads_covs)
-                else:
-                    assert self.algorithm == "mse"
-
-                if self.weights_normalization != "grad-norm":
-                    actual_weights = solve_qp(C, b, positive=positive,
-                                              maxiters=self.maxiters, eps=self.eps)
-                    actual_weights = self._normalize_weights(actual_weights)
-                else:
-                    equal_norm = pretrain_covariances.detach().sum().sqrt()
-                    actual_weights = solve_qcqp(C, -b) * equal_norm
-                    if positive:
-                        # More stable than solve_qcqp(..., positive=True).
-                        actual_weights = actual_weights.clip(min=0)
-            else:
-                assert self.algorithm == "none"
-                actual_weights = torch.ones_like(logits)
-                actual_weights = self._normalize_weights(actual_weights, pretrain_covariances=pretrain_covariances)
-
-            actual_weights = self._update_grads_cache(actual_weights, stage="weights")
-
-            if self._buffers["correlations"] is not None:
-                if n_updates > 1:
-                    self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
-                    self._buffers["avg_correlations"] += self._buffers["correlations"] / n_updates
-                    self._buffers["ema_correlations"] *= self.cov_momentum
-                    self._buffers["ema_correlations"] += (1 - self.cov_momentum) * self._buffers["correlations"]
-                else:
-                    self._buffers["avg_correlations"] = self._buffers["correlations"].clone()
-                    self._buffers["ema_correlations"] = self._buffers["correlations"].clone()
-
-            self._buffers["weights"] = actual_weights.detach().clone()
-            if n_updates > 1:
-                self._buffers["avg_weights"] *= (n_updates - 1) / n_updates
-                self._buffers["avg_weights"] += self._buffers["weights"] / n_updates
-                self._buffers["ema_weights"] *= self.cov_momentum
-                self._buffers["ema_weights"] += (1 - self.cov_momentum) * self._buffers["weights"]
-            else:
-                self._buffers["avg_weights"] = self._buffers["weights"].clone()
-                self._buffers["ema_weights"] = self._buffers["weights"].clone()
-
-            # Set hyperparameters and their grads.
-            if self.algorithm == "sgd":
-                assert logits.grad is not None
-            else:
-                if torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1):
-                    # Synchronize weights.
-                    torch.distributed.all_reduce(actual_weights, op=torch.distributed.ReduceOp.SUM)
-                    actual_weights /= torch.distributed.get_world_size()
-                logits.copy_(actual_weights)
-                logits.grad = None
-
-            if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(actual_weights) < self.eps):
+            if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(weights) < self.eps):
                 skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
                 if not skip_step:
-                    actual_weights = self._normalize_weights(torch.ones_like(actual_weights), pretrain_covariances=pretrain_covariances)
+                    weights = self._normalize_weights(torch.ones_like(weights), pretrain_covariances=pretrain_covariances)
             else:
                 skip_step = False
                 self._buffers["n_skipped_steps"] = 0
 
             # Cache returned value.
-            output_weights.copy_(actual_weights)
+            output_weights.copy_(weights)
 
             # Set gradients for model weights.
             if self.encoder_decoder:
                 # Set grads for the encoder (backbone) model. Keep logits grad intact.
-                z_grad = sum([w * all_z_grads[i] for i, w in enumerate(actual_weights)], self.encoder_downstream_weight * z_down_grads)
-                logits_grad = logits.grad
-                logits.grad = None
+                z_grad = sum([w * grads["all_z_grads"][i] for i, w in enumerate(weights)], self.encoder_downstream_weight * grads["z_down_grads"])
+                logits_grad = self.logits.grad
+                self.logits.grad = None
                 closure_encoder(z_grad)
-                logits.grad = logits_grad
+                self.logits.grad = logits_grad
                 z_grad_norm = torch.linalg.norm(z_grad)
                 if z_grad_norm > self.eps:
                     encoder_grad = self._gather_grads("encoder")
@@ -638,8 +653,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del z_grad
 
             # Set grads for the shared model.
-            shared_grad = sum([w * all_shared_grads[i] for i, w in enumerate(actual_weights[:-1])], actual_weights[-1] * all_shared_grads[-1])
+            shared_grad = sum([w * grads["all_shared_grads"][i] for i, w in enumerate(weights[:-1])], weights[-1] * grads["all_shared_grads"][-1])
             if self.downstream_merge:
+                shared_down_grads = grads["shared_down_grads"]
                 mask = shared_grad == 0
                 shared_grad = torch.where(mask, shared_down_grads, shared_grad)
                 shared_down_grads.masked_fill_(mask, 0)
@@ -662,7 +678,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             del shared_grad
 
             # Set grads for individual heads model.
-            heads_grad = sum(all_heads_grads, heads_down_grads)
+            heads_grad = sum(grads["all_heads_grads"], grads["heads_down_grads"])
             offset = 0
             for p in self.param_groups[1]["params"]:
                 numel = p.numel()
@@ -675,23 +691,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.heads_gradient_normalizer(self.param_groups[1]["params"])
                 self.shared_gradient_normalizer(itertools.chain(*[group["params"] for group in self.param_groups[2:]]))
             if self.algorithm == "sgd":
-                self.hp_gradient_normalizer(self.param_groups[0]["params"])
+                self.hp_gradient_normalizer([self.logits])
 
             if after_backward_hook is not None:
                 after_backward_hook()
 
             if self.algorithm == "sgd":
-                logits_grads.copy_(self.param_groups[0]["params"][0].grad)
+                logits_grads.copy_(self.logits.grad)
 
             if skip_step:
                 raise ZeroWeightsException()
         try:
-            logits_orig = self.param_groups[0]["params"][0].clone()
+            logits_orig = self.logits.clone()
             self.step(inner_closure, inner=True)
-            if (self.algorithm == "sgd") and self.hp_simple_gd:
+            if self.hp_simple_gd and (self.algorithm == "sgd") and (self.align != "val"):
                 lr = self.param_groups[0].get("lr", self.defaults.get("lr", None))
                 with torch.no_grad():
-                    self.param_groups[0]["params"][0].copy_(logits_orig - lr * logits_grads)
+                    self.logits.copy_(logits_orig - lr * logits_grads)
         except ZeroWeightsException:
             pass
         return output_weights
@@ -710,7 +726,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         self.base_optimizer.load_state_dict(state_dict)
         self.param_groups = self.base_optimizer.param_groups
-        p = self.param_groups[0]["params"][0]
+        p = self.logits
         self._grads_cache.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                   for k, v in state_dict.get("grads_cache", {}).items()})
         self._buffers.update({k: (v.to(device=p.device, dtype=p.dtype) if isinstance(v, torch.Tensor) else v)
@@ -755,7 +771,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 else:
                     grads.append(p.grad.flatten())
         if not grads:
-            return torch.zeros_like(self.param_groups[0]["params"][0][:0])
+            return torch.zeros_like(self.logits[:0])
         return torch.cat(grads)
 
     def apply_optimizer_correction_(self, part, grads):
