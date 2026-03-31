@@ -329,6 +329,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         z_down = closure(downstream_weight, loss_weights, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
         if self.encoder_decoder and (z_down is None or z_down.grad is None):
             raise TypeError("In the encoder-decoder mode, closure must return embedding with gradient.")
+        if self.encoder_decoder:
+            z_down_grads = z_down.grad.flatten()
+            z_down = z_down.data.clone()
         heads_down_grads = self._gather_grads("heads")
         shared_down_grads = self._gather_grads("shared")
 
@@ -348,15 +351,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             heads_grads = self._gather_grads("heads")
             shared_grads = self._gather_grads("shared")
             if self.encoder_decoder:
-                all_z_grads.append(z.grad.flatten())
+                all_z_grads.append(z.grad.flatten().clone())
             all_heads_grads.append(heads_grads)
             all_shared_grads.append(shared_grads)
 
         return {
             "heads_down_grads": heads_down_grads,
             "shared_down_grads": shared_down_grads,
-            "z_down": z_down,
-            "z_down_grads": z_down.grad.flatten() if z_down is not None else None,
+            "z_down": z_down if self.encoder_decoder else None,
+            "z_down_grads": z_down_grads if self.encoder_decoder else None,
             "all_heads_grads": all_heads_grads,
             "all_shared_grads": all_shared_grads,
             "all_z_grads": all_z_grads,
