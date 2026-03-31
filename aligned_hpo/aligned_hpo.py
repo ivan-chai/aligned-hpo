@@ -209,7 +209,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return self.param_groups[0]["params"][0]
 
     @property
-    def need_validation(self):
+    def use_validation(self):
         return self.align != "train"
 
     def step(self, closure=None, *, inner=False):
@@ -306,11 +306,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             momentum = self.main_momentum
 
         if self._grads_cache[stage] is None:
-            self._grads_cache[stage] = value
+            self._grads_cache[stage] = grads
         else:
             if momentum > 0:
-                value = self._grads_cache[stage] * momentum + value * (1 - momentum)
-            self._grads_cache[stage] = value
+                grads = self._grads_cache[stage] * momentum + grads * (1 - momentum)
+            self._grads_cache[stage] = grads
         return self._grads_cache[stage]
 
     @torch.no_grad()
@@ -349,14 +349,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             heads_grads = self._gather_grads("heads")
             shared_grads = self._gather_grads("shared")
             if self.encoder_decoder:
-                all_z_grads.append(z.grad)
+                all_z_grads.append(z.grad.flatten())
             all_heads_grads.append(heads_grads)
             all_shared_grads.append(shared_grads)
 
         return {
             "heads_down_grads": heads_down_grads,
             "shared_down_grads": shared_down_grads,
-            "z_down_grads": z_down.grad if z_down is not None else None,
+            "z_down_grads": z_down.grad.flatten() if z_down is not None else None,
             "all_heads_grads": all_heads_grads,
             "all_shared_grads": all_shared_grads,
             "all_z_grads": all_z_grads,
@@ -439,10 +439,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if self.apply_optimizer_correction:
                 loss_grads = loss_grads.clone()
                 self.apply_optimizer_correction_("shared", loss_grads)
-            loss_grads = torch.cat([z.grad, loss_grads]) if self.encoder_decoder else loss_grads
+            loss_grads = torch.cat([z.grad.flatten(), loss_grads]) if self.encoder_decoder else loss_grads
             all_grads.append(loss_grads)
             if self.encoder_decoder:
-                all_z_grads.append(z.grad)
+                all_z_grads.append(z.grad.flatten())
             all_heads_grads.append(heads_grads)
             all_shared_grads.append(shared_grads)
 
@@ -517,7 +517,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return {
             "heads_down_grads": heads_down_grads,
             "shared_down_grads": shared_down_grads,
-            "z_down_grads": z_down.grad if z_down is not None else None,
+            "z_down_grads": z_down.grad.flatten() if z_down is not None else None,
             "all_heads_grads": all_heads_grads,
             "all_shared_grads": all_shared_grads,
             "all_z_grads": all_z_grads,
