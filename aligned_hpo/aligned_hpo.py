@@ -118,7 +118,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  encoder_decoder=False, algorithm="sgd", ema=0, align="train",
                  apply_optimizer_correction=False, apply_gradient_normalizer=False,
                  skip_step_zero_weights_limit=5, hp_simple_gd=True, clip_hp_grad=None,
-                 z_grad_lr=0.001, maxiters=100, eps=1e-6):
+                 warmup_steps=0, z_grad_lr=0.001, maxiters=100, eps=1e-6):
         if (weights_parametrization == "linear") and (weights_normalization == "sum"):
             raise ValueError("A 'sum' normalization can be applied to positive weights only.")
         params = list(params)
@@ -186,6 +186,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self.hp_gradient_normalizer = GradientNormalizer(clip=1e-12, momentum=self.stats_momentum)
         self.hp_simple_gd = hp_simple_gd
         self.clip_hp_grad = clip_hp_grad
+        self.warmup_steps = warmup_steps
         self.z_grad_lr = z_grad_lr
         self.maxiters = maxiters
         self.eps = eps
@@ -319,8 +320,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             assert isinstance(stage, Number)
             momentum = self.main_momentum
         # TODO: Don't store gradients if momentum = 0.
+
         if self._grads_cache[stage] is None:
             self._grads_cache[stage] = grads
+        elif self._buffers["n_updates"] < self.warmup_steps:
+            step = self._buffers["n_updates"]
+            assert step > 0
+            self._grads_cache[stage] = (self._grads_cache[stage] * step + grads) / (step + 1)
         else:
             if momentum > 0:
                 grads = self._grads_cache[stage] * momentum + grads * (1 - momentum)
@@ -466,13 +472,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         products = self._update_grads_cache(products, "products")
 
         logits = self.logits
-        self._buffers["n_updates"] += 1
         self._buffers["correlations"] = products.detach().clone()
         self._buffers["tune_grad_norms"] = all_grads_covs.diag().sqrt()
         self._buffers["tune_grad_norm_downstream"] = torch.linalg.norm(down_grads)
-        n_updates = self._buffers["n_updates"]
 
-        self._compute_weights_gradients(all_grads_covs, products)
+        if self._buffers["n_updates"] < self.warmup_steps:
+            self.logits.grad = torch.zeros_like(self.logits)
+        else:
+            self._compute_weights_gradients(all_grads_covs, products)
         if is_distributed:
             torch.distributed.all_reduce(self.logits.grad, op=torch.distributed.ReduceOp.SUM)
             self.logits.grad /= torch.distributed.get_world_size()
@@ -490,6 +497,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         else:
             weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
         weights = self._update_grads_cache(weights, stage="weights")
+
+        self._buffers["n_updates"] += 1
+        n_updates = self._buffers["n_updates"]
 
         if n_updates > 1:
             self._buffers["avg_correlations"] *= (n_updates - 1) / n_updates
