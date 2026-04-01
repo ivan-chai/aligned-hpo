@@ -459,8 +459,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if is_distributed:
             torch.distributed.all_reduce(all_grads_covs, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(products, op=torch.distributed.ReduceOp.SUM)
-            all_grads_covs /= torch.distributed.get_world_size()
-            products /= torch.distributed.get_world_size()
+            all_grads_covs /= torch.distributed.get_world_size() ** 2
+            products /= torch.distributed.get_world_size() ** 2
 
         all_grads_covs = self._update_grads_cache(all_grads_covs, "covs")
         products = self._update_grads_cache(products, "products")
@@ -486,8 +486,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Set weights closed-form.
             self.logits.copy_(self.logits - self.logits.grad)
             self.logits.grad = None
-
-        weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+            weights = self.logits
+        else:
+            weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
         weights = self._update_grads_cache(weights, stage="weights")
 
         if n_updates > 1:
