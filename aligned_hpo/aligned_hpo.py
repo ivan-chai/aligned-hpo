@@ -34,13 +34,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         base_optimizer_params: Parameters of the base optimizer.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
-        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", or "none"), or a number to divide weights by.
+        weights_normalization: Weights normalization type ("sum", "norm", "grad-norm", "grad-norm-scaled", or "none"), or a number to divide weights by.
         downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
         algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
-        ema: Use momentum for gradient smoothing. Can be a dictionary with "downstream", "main", "weights", and "stats" keys. See notes below.
+        ema: Use momentum for gradient smoothing. Can be a dictionary with "downstream", "main", "covs", "weights", and "stats" keys. See notes below.
         align: Either `train` to tune weights on the train set only, `val`, or `train-val` to align training gradients with validation downstream grad.
         apply_gradient_normalizer: Normalize gradients using running statistics.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
@@ -53,6 +53,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     There are multiple smoothing techinques that help to reduce overfitting on the val set.
     Three main parameters: "downstream", "main", and "weights", that control smoothing of the pretraining and downstream gradients respectivelly.
     There are some additional smoothing parameters:
+    - "covs" can be used to control smoothing of gradient covariances.
     - "stats" can be used to control covariances estimation smoothing. By default, "stats" smoothing is equal to DEFAULT_EMA_STATS otherwise.
 
     NOTE. Encoder-Decoder vs full gradients.
@@ -158,19 +159,21 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
 
         if isinstance(ema, Number):
-            ema = {k: ema for k in ["downstream", "main", "weights"]}
+            ema = {k: ema for k in ["downstream", "main"]}
         ema_defaults = {
             "downstream": 0,
             "main": 0,
+            "covs": 0,
             "weights": 0,
             "stats": DEFAULT_EMA_STATS
         }
         ema = dict(ema_defaults, **ema)
-        unknown_keys = set(ema) - {"downstream", "main", "weights", "stats"}
+        unknown_keys = set(ema) - {"downstream", "main", "covs", "weights", "stats"}
         if unknown_keys:
             raise ValueError(f"Unknown EMA keys: {unknown_keys}")
         self.downstream_momentum = ema["downstream"]
         self.main_momentum = ema["main"]
+        self.covs_momentum = ema["covs"]
         self.weights_momentum = ema["weights"]
         self.stats_momentum = ema["stats"]
 
@@ -188,7 +191,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.eps = eps
 
         # TODO: use optimizer state for gradient caches.
-        self._grads_cache = {HPO_STAGE_DOWNSTREAM: None, "weights": None} | {i: None for i in range(self.n_weights)}
+        self._grads_cache = {HPO_STAGE_DOWNSTREAM: None, "weights": None, "covs": None, "products": None} | {i: None for i in range(self.n_weights)}
         if encoder_decoder:
             self._grads_cache["jacobian"] = None
             if (self.align == "train-val") and self.encoder_decoder:
@@ -198,7 +201,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             "n_updates": 0,
             "weights": None,
             "ema_weights": None,
-            "avg_weights": None
+            "avg_weights": None,
+            "tune_grad_norm_downstream": None,
+            "tune_grad_norms": None
         }
 
         if self.algorithm != "none":
@@ -235,6 +240,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 result[f"avg_weights_{name}"] = c
             for name, c in zip(self.weights_names, self._buffers["ema_weights"]):
                 result[f"ema_weights_{name}"] = c
+        if self._buffers["tune_grad_norms"] is not None:
+            for name, c in zip(self.weights_names, self._buffers["tune_grad_norms"]):
+                result[f"tune_grad_norm_{name}"] = c
+        if self._buffers["tune_grad_norm_downstream"] is not None:
+            result[f"tune_grad_norm_downstream"] = self._buffers["tune_grad_norm_downstream"]
         if self.apply_gradient_normalizer:
             if not self.heads_gradient_normalizer.is_first:
                 result["heads_gradient_moving_norm"] = self.heads_gradient_normalizer.moving_norm
@@ -288,6 +298,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             # Unscale.
             weights = weights / (scales + 1e-12)
+
             return weights
         else:
             assert self.weights_normalization == "none"
@@ -303,6 +314,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             momentum = self.weights_momentum
         elif stage in {"jacobian"}:
             momentum = self.stats_momentum
+        elif stage in {"covs", "products"}:
+            momentum = self.covs_momentum
         else:
             assert isinstance(stage, Number)
             momentum = self.main_momentum
@@ -416,10 +429,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         all_grads = torch.stack(all_grads, 0)  # (W, P).
         all_grads_covs = all_grads @ all_grads.T
         products = all_grads @ down_grads  # (W).
+        all_grads_covs = self._update_grads_cache(all_grads_covs, "covs")
+        products = self._update_grads_cache(products, "products")
 
         logits = self.logits
         self._buffers["n_updates"] += 1
         self._buffers["correlations"] = products.detach().clone()
+        self._buffers["tune_grad_norms"] = all_grads_covs.diag().sqrt()
+        self._buffers["tune_grad_norm_downstream"] = torch.linalg.norm(down_grads)
         n_updates = self._buffers["n_updates"]
 
         if self.algorithm == "sgd":
@@ -443,11 +460,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                                    maxiters=self.maxiters, eps=self.eps)
                 weights = self._normalize_weights(weights)
             else:
-                equal_norm = all_grads_covs.detach().sum().sqrt()
-                weights = solve_qcqp(all_grads_covs, products) * equal_norm
-                if positive:
-                    # More stable than solve_qcqp(..., positive=True).
-                    weights = weights.clip(min=0)
+                scale = all_grads_covs.detach().sum().sqrt() if self.weights_normalization == "grad-norm-scaled" else 1
+                weights = solve_qcqp(all_grads_covs, products, positive=positive) * scale
         else:
             assert self.algorithm == "none"
             weights = torch.ones_like(logits)
@@ -461,7 +475,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 # Synchronize weights.
                 torch.distributed.all_reduce(weights, op=torch.distributed.ReduceOp.SUM)
                 weights /= torch.distributed.get_world_size()
-            logits.copy_(weights)
+            if self.clip_hp_grad is not None:
+                grad = weights - logits
+                grad_norm = torch.linalg.norm(grad)
+                if grad_norm > self.clip_hp_grad:
+                    grad = grad / grad_norm * self.clip_hp_grad
+                logits.add_(grad)
+            else:
+                logits.copy_(weights)
             logits.grad = None
 
         weights = self._update_grads_cache(weights, stage="weights")
