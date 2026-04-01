@@ -39,14 +39,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
-        algorithm: Either "sgd", "mse", "expected-error", or "none" to disable HPO.
+        algorithm: Either "sgd", "mse", or "none" to disable HPO.
         ema: Use momentum for gradient smoothing. Can be a dictionary with "downstream", "main", "covs", "weights", and "stats" keys. See notes below.
         align: Either `train` to tune weights on the train set only, `val`, or `train-val` to align training gradients with validation downstream grad.
         apply_gradient_normalizer: Normalize gradients using running statistics.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         hp_simple_gd: Use simple gradient descent for the weights.
         clip_hp_grad: Clipping value for hyperparameters gradients when "sgd" algorithm is used.
-        maxiters: The maximum number of iterations in the QP solver, used for "mse" and "expected-error" algorithms.
+        maxiters: The maximum number of iterations in the QP solver, used for the "mse" algorithm.
 
     NOTE. Exponential Moving Average (EMA)
 
@@ -305,7 +305,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return weights
 
     def _update_grads_cache(self, grads, stage=None):
-        return_smoothed = True
         if stage not in self._grads_cache:
             raise ValueError(f"Unknown stage: {stage}")
         if stage in {HPO_STAGE_DOWNSTREAM, "encoder"}:
@@ -381,6 +380,32 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         }
 
     @torch.no_grad()
+    def _compute_weights_gradients(self, all_grads_covs, products):
+        if self.algorithm == "sgd":
+            with torch.enable_grad():
+                weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+            self.logits.grad = None
+            weights.backward(-products)
+        elif self.algorithm == "mse":
+            if self.weights_parametrization == "abs":
+                positive = True
+            else:
+                assert self.weights_parametrization == "linear"
+                positive = False
+
+            if self.weights_normalization not in {"grad-norm", "grad-norm-scaled"}:
+                weights = solve_qp(all_grads_covs, -products, positive=positive,
+                                   maxiters=self.maxiters, eps=self.eps)
+                weights = self._normalize_weights(weights)
+            else:
+                scale = all_grads_covs.detach().sum().sqrt() if self.weights_normalization == "grad-norm-scaled" else 1
+                weights = solve_qcqp(all_grads_covs, products, positive=positive) * scale
+            self.logits.grad = self.logits - weights
+        else:
+            assert self.algorithm == "none"
+            self.logits.grad = torch.zeros_like(self.logits)
+
+    @torch.no_grad()
     def _tune_weights(self, closure, embed_fn=None):
         """Update weights (gradient or value) and return cached gradients."""
         grads = self._get_loss_grads(closure)
@@ -429,6 +454,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         all_grads = torch.stack(all_grads, 0)  # (W, P).
         all_grads_covs = all_grads @ all_grads.T
         products = all_grads @ down_grads  # (W).
+
+        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
+        if is_distributed:
+            torch.distributed.all_reduce(all_grads_covs, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(products, op=torch.distributed.ReduceOp.SUM)
+            all_grads_covs /= torch.distributed.get_world_size()
+            products /= torch.distributed.get_world_size()
+
         all_grads_covs = self._update_grads_cache(all_grads_covs, "covs")
         products = self._update_grads_cache(products, "products")
 
@@ -439,52 +472,22 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._buffers["tune_grad_norm_downstream"] = torch.linalg.norm(down_grads)
         n_updates = self._buffers["n_updates"]
 
-        if self.algorithm == "sgd":
-            with torch.enable_grad():
-                weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
-            logits.grad = None
-            weights.backward(-products)
-            if self.clip_hp_grad is not None:
-                grad_norm = torch.linalg.norm(logits.grad)
-                if grad_norm > self.clip_hp_grad:
-                    logits.grad *= self.clip_hp_grad / (grad_norm + self.eps)
-        elif self.algorithm == "mse":
-            if self.weights_parametrization == "abs":
-                positive = True
-            else:
-                assert self.weights_parametrization == "linear"
-                positive = False
+        self._compute_weights_gradients(all_grads_covs, products)
+        if is_distributed:
+            torch.distributed.all_reduce(self.logits.grad, op=torch.distributed.ReduceOp.SUM)
+            self.logits.grad /= torch.distributed.get_world_size()
 
-            if self.weights_normalization not in {"grad-norm", "grad-norm-scaled"}:
-                weights = solve_qp(all_grads_covs, -products, positive=positive,
-                                   maxiters=self.maxiters, eps=self.eps)
-                weights = self._normalize_weights(weights)
-            else:
-                scale = all_grads_covs.detach().sum().sqrt() if self.weights_normalization == "grad-norm-scaled" else 1
-                weights = solve_qcqp(all_grads_covs, products, positive=positive) * scale
-        else:
-            assert self.algorithm == "none"
-            weights = torch.ones_like(logits)
-            weights = self._normalize_weights(weights, pretrain_covariances=all_grads_covs)
+        if self.clip_hp_grad is not None:
+            grad_norm = torch.linalg.norm(self.logits.grad)
+            if grad_norm > self.clip_hp_grad:
+                self.logits.grad *= self.clip_hp_grad / (grad_norm + self.eps)
 
-        # Set hyperparameters and their grads.
-        if self.algorithm == "sgd":
-            assert logits.grad is not None
-        else:
-            if torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1):
-                # Synchronize weights.
-                torch.distributed.all_reduce(weights, op=torch.distributed.ReduceOp.SUM)
-                weights /= torch.distributed.get_world_size()
-            if self.clip_hp_grad is not None:
-                grad = weights - logits
-                grad_norm = torch.linalg.norm(grad)
-                if grad_norm > self.clip_hp_grad:
-                    grad = grad / grad_norm * self.clip_hp_grad
-                logits.add_(grad)
-            else:
-                logits.copy_(weights)
-            logits.grad = None
+        if self.algorithm != "sgd":
+            # Set weights closed-form.
+            self.logits.copy_(self.logits - self.logits.grad)
+            self.logits.grad = None
 
+        weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
         weights = self._update_grads_cache(weights, stage="weights")
 
         if n_updates > 1:
@@ -544,7 +547,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if self.encoder_decoder:
                 closure_encoder(z_down.grad.flatten())
                 encoder_grads = self._gather_grads("encoder")
-                if torch.linalg.norm(encoder_grads) == 0:
+                if torch.linalg.norm(encoder_grads) < 1e-12:
                     raise RuntimeError("Zero-norm encoder gradient")
                 self._update_grads_cache(encoder_grads, stage="encoder")
             return
@@ -564,9 +567,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             if after_backward_hook is not None:
                 after_backward_hook()
-
-            if self.algorithm == "sgd":
-                logits_grads.copy_(self.logits.grad)
         if (self.algorithm == "sgd") and self.hp_simple_gd:
             inner_closure()
             lr = self.param_groups[0].get("lr", self.defaults.get("lr", None))
@@ -658,7 +658,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             offset = 0
             for i, group in enumerate(param_groups):
                 downstream_weight = self.shared_downstream_weight if i == 0 else self.encoder_downstream_weight
-                shared_decoder = i == 0
                 for p in group["params"]:
                     numel = p.numel()
                     p.grad = shared_grad[offset:offset + numel].reshape(p.shape)
