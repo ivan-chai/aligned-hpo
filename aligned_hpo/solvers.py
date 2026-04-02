@@ -22,8 +22,10 @@ def solve_qp(C, b, method="cvxopt", eps=1e-6, maxiters=100,
     C /= scale
     b /= scale
 
-    # Regularize.
-    if np.linalg.det(C) < eps:
+    # Regularize to ensure positive-definiteness. Use the smallest eigenvalue
+    # as a robust check instead of the determinant, which can be misleadingly
+    # small for higher-dimensional matrices (product of many eigenvalues).
+    if np.linalg.eigvalsh(C)[0] < eps:
         C = C + np.eye(n) * eps
 
     zeros = np.zeros(n, dtype=np.double)

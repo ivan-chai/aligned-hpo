@@ -284,21 +284,31 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if pretrain_covariances is None:
                 raise ValueError("Need covariances for grad-norm")
             pretrain_covariances = pretrain_covariances.detach()
-            # Scale to the gradient norm of equal weights.
+
+            # Pre-scale covariance to O(1) for numerical stability with tiny gradients.
+            # All intermediate computations use the pre-scaled matrix; the final result
+            # is corrected so that it equals the one obtained without pre-scaling.
+            cov_scale = pretrain_covariances.diag().max().clamp(min=self.eps ** 2)
+
+            # Scale to the gradient norm of equal weights (use original covariance).
             target_norm = pretrain_covariances.sum().sqrt() if self.weights_normalization == "grad-norm-scaled" else 1
 
-            # Scale weights and covariances.
-            scales = torch.diag(pretrain_covariances).sqrt()  # (W).
-            pretrain_covariances = pretrain_covariances / (scales[:, None] * scales[None, :] + 1e-12)
-            weights = RescaleWeights.apply(weights, scales + 1e-12)
+            pretrain_covariances = pretrain_covariances / cov_scale
 
-            # Normalize.
-            norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
-            weights = weights / (norm + 1e-12)
+            # Scale weights and covariances.
+            scales = torch.diag(pretrain_covariances).sqrt().clamp(min=self.eps)  # (W).
+            pretrain_covariances = pretrain_covariances / (scales[:, None] * scales[None, :])
+            weights = RescaleWeights.apply(weights, scales)
+
+            # Normalize. The pre-scaled norm² = w^T (C/cov_scale) w = (w^T C w) / cov_scale,
+            # so multiply by sqrt(cov_scale) to recover the true norm.
+            norm = (weights[None] @ pretrain_covariances @ weights).sqrt() * cov_scale.sqrt()
+            norm = norm.clamp(min=self.eps)
+            weights = weights / norm
             weights = weights * target_norm
 
             # Unscale.
-            weights = weights / (scales + 1e-12)
+            weights = weights / scales
 
             return weights
         else:
@@ -390,8 +400,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.algorithm == "sgd":
             with torch.enable_grad():
                 weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+            # Normalize products before backward to avoid tiny gradient magnitudes
+            # propagating through the normalization graph when gradients are small.
+            products_scale = products.norm().clamp(min=self.eps)
             self.logits.grad = None
-            weights.backward(-products)
+            weights.backward(-products / products_scale)
+            self.logits.grad = self.logits.grad * products_scale
         elif self.algorithm == "mse":
             if self.weights_parametrization == "abs":
                 positive = True
@@ -458,8 +472,20 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             all_grads.append(loss_grads)
 
         all_grads = torch.stack(all_grads, 0)  # (W, P).
-        all_grads_covs = all_grads @ all_grads.T
-        products = all_grads @ down_grads  # (W).
+
+        # Pre-normalize gradients to avoid tiny covariance/product entries
+        # when gradient magnitudes are very small (e.g. 1e-10 to 1e-12).
+        # Only apply when gradients are small enough that float32 precision
+        # becomes a concern (values below ~1e-4 produce covs below ~1e-8).
+        grad_scale = all_grads.norm()
+        if 0 < grad_scale < 1e-4:
+            all_grads_s = all_grads / grad_scale
+            down_grads_s = down_grads / grad_scale
+            all_grads_covs = all_grads_s @ all_grads_s.T * (grad_scale ** 2)
+            products = (all_grads_s @ down_grads_s) * (grad_scale ** 2)  # (W).
+        else:
+            all_grads_covs = all_grads @ all_grads.T
+            products = all_grads @ down_grads  # (W).
 
         is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
         if is_distributed:
