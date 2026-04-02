@@ -333,10 +333,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if self._grads_cache[stage] is None:
             self._grads_cache[stage] = grads
-        elif self._buffers["n_updates"] < self.warmup_steps:
-            step = self._buffers["n_updates"]
-            assert step > 0
-            self._grads_cache[stage] = (self._grads_cache[stage] * step + grads) / (step + 1)
         else:
             if momentum > 0:
                 grads = self._grads_cache[stage] * momentum + grads * (1 - momentum)
