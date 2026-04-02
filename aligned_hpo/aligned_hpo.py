@@ -645,7 +645,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 grads = self._tune_weights(closure, embed_fn=embed_fn)
             weights = self._grads_cache["weights"]
 
-            if (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(weights) < self.eps):
+            if self._buffers["n_updates"] < self.warmup_steps:
+                skip_step = True
+            elif (self.algorithm != "sgd") and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(weights) < self.eps):
                 skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
                 if not skip_step:
