@@ -469,19 +469,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         all_grads = torch.stack(all_grads, 0)  # (W, P).
 
-        # Pre-normalize gradients to avoid tiny covariance/product entries
-        # when gradient magnitudes are very small (e.g. 1e-10 to 1e-12).
-        # Only apply when gradients are small enough that float32 precision
-        # becomes a concern (values below ~1e-4 produce covs below ~1e-8).
-        grad_scale = all_grads.norm()
-        if 0 < grad_scale < 1e-4:
-            all_grads_s = all_grads / grad_scale
-            down_grads_s = down_grads / grad_scale
-            all_grads_covs = all_grads_s @ all_grads_s.T * (grad_scale ** 2)
-            products = (all_grads_s @ down_grads_s) * (grad_scale ** 2)  # (W).
-        else:
-            all_grads_covs = all_grads @ all_grads.T
-            products = all_grads @ down_grads  # (W).
+        all_grads_scale = torch.linalg.norm(all_grads, dim=1).max().clamp(min=1e-12)
+        all_grads /= all_grads_scale
+        down_grads = torch.nn.functional.normalize(down_grads, dim=0)
+
+        all_grads_covs = all_grads @ all_grads.T
+        products = all_grads @ down_grads  # (W).
 
         is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
         if is_distributed:
