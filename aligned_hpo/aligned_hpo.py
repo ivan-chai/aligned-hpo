@@ -290,7 +290,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Scale weights and covariances.
             scales = torch.diag(pretrain_covariances).sqrt()  # (W).
             pretrain_covariances = pretrain_covariances / (scales[:, None] * scales[None, :] + 1e-12)
-            weights = RescaleWeights.apply(weights, scales)
+            weights = RescaleWeights.apply(weights, scales + 1e-12)
 
             # Normalize.
             norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
