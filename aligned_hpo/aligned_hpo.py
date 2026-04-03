@@ -331,12 +331,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             momentum = self.main_momentum
         # TODO: Don't store gradients if momentum = 0.
 
-        if self._grads_cache[stage] is None:
+        if (self._grads_cache[stage] is None) or (self._buffers["n_updates"] < self.warmup_steps):
             self._grads_cache[stage] = grads
-        elif self._buffers["n_updates"] < self.warmup_steps:
-            step = self._buffers["n_updates"]
-            assert step > 0
-            self._grads_cache[stage] = (self._grads_cache[stage] * step + grads) / (step + 1)
         else:
             if momentum > 0:
                 grads = self._grads_cache[stage] * momentum + grads * (1 - momentum)
@@ -497,11 +493,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if self._buffers["n_updates"] < self.warmup_steps:
             self.logits.grad = torch.zeros_like(self.logits)
-            grads["shared_down_grads"].fill_(0)
-            grads["z_down_grads"].fill_(0)
-            for i in range(self.n_weights):
-                grads["all_shared_grads"][i].fill_(0)
-                grads["all_z_grads"][i].fill_(0)
         else:
             self._compute_weights_gradients(all_grads_covs, products)
         if is_distributed:
@@ -545,6 +536,22 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._buffers["ema_weights"] = self._buffers["weights"].clone()
 
         return grads | {"all_grads_covs": all_grads_covs}
+
+    @torch.no_grad()
+    def common_step(self, inner_closure):
+        if self._buffers["n_updates"] < self.warmup_steps:
+            # Compute gradients.
+            inner_closure()
+
+            # Update heads with simple GD.
+            for group in self.param_groups[1:3]:
+                lr = group.get("lr", self.defaults.get("lr", None))
+                assert lr is not None
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.copy_(p.data - lr * p.grad)
+        else:
+            self.step(inner_closure, inner=True)
 
     @torch.no_grad()
     def val_step(self, closure, closure_encoder=None, embed_fn=None, after_backward_hook=None):
@@ -609,7 +616,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.logits.add_(- lr * self.logits.grad)
         elif self.algorithm == "sgd":
             # Use optimizer.
-            self.step(inner_closure, inner=True)
+            self.common_step(inner_closure)
         else:
             # Closed-form computation.
             assert self.algorithm in {"mse", "none"}
@@ -728,7 +735,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 raise ZeroWeightsException()
         try:
             logits_orig = self.logits.clone()
-            self.step(inner_closure, inner=True)
+            self.common_step(inner_closure)
             if self.hp_simple_gd and (self.algorithm == "sgd") and (self.align != "val"):
                 lr = self.param_groups[0].get("lr", self.defaults.get("lr", None))
                 with torch.no_grad():
