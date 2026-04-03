@@ -497,6 +497,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if self._buffers["n_updates"] < self.warmup_steps:
             self.logits.grad = torch.zeros_like(self.logits)
+            grads["shared_down_grads"].fill_(0)
+            grads["z_down_grads"].fill_(0)
+            for i in range(self.n_weights):
+                grads["all_shared_grads"][i].fill_(0)
+                grads["all_z_grads"][i].fill_(0)
         else:
             self._compute_weights_gradients(all_grads_covs, products)
         if is_distributed:
