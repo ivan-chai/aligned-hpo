@@ -331,8 +331,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             momentum = self.main_momentum
         # TODO: Don't store gradients if momentum = 0.
 
-        if (self._grads_cache[stage] is None) or (self._buffers["n_updates"] < self.warmup_steps):
+        if self._grads_cache[stage] is None:
             self._grads_cache[stage] = grads
+        elif self._buffers["n_updates"] < self.warmup_steps:
+            step = self._buffers["n_updates"]
+            assert step > 0
+            self._grads_cache[stage] = (self._grads_cache[stage] * step + grads) / (step + 1)
         else:
             if momentum > 0:
                 grads = self._grads_cache[stage] * momentum + grads * (1 - momentum)
@@ -540,16 +544,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     @torch.no_grad()
     def common_step(self, inner_closure):
         if self._buffers["n_updates"] < self.warmup_steps:
-            # Compute gradients.
-            inner_closure()
-
-            # Update heads with simple GD.
-            for group in self.param_groups[1:3]:
-                lr = group.get("lr", self.defaults.get("lr", None))
-                assert lr is not None
-                for p in group["params"]:
-                    if p.grad is not None:
-                        p.copy_(p.data - lr * p.grad)
+            def clean_grads_closure():
+                inner_closure()
+                # Clean gradients for all groups except 1 and 2.
+                self.param_groups[0]["params"][0].grad = None
+                for group in self.param_groups[3:]:
+                    for p in group["params"]:
+                        p.grad = None
+            self.step(clean_grads_closure, inner=True)
         else:
             self.step(inner_closure, inner=True)
 
