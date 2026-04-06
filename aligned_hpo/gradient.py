@@ -39,16 +39,3 @@ class GradientNormalizer(torch.nn.Module):
         for i, p in enumerate(parameters):
             norms[i] = p.grad.data.norm(2)
         return norms.square().sum().item() ** 0.5
-
-
-class RescaleWeights(torch.autograd.Function):
-    """Scale value and gradients so that GD on hidden mimics GD on output."""
-
-    @staticmethod
-    def forward(ctx, src, weight):
-        ctx._weight = weight
-        return src * weight
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output / ctx._weight, None
