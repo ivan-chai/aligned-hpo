@@ -702,8 +702,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.apply_gradient_normalizer:
             state["heads_gradient_normalizer"] = self.heads_gradient_normalizer.state_dict()
             state["encoder_gradient_normalizer"] = self.encoder_gradient_normalizer.state_dict()
-        if self.algorithm == "sgd":
-            state["hp_gradient_normalizer"] = self.hp_gradient_normalizer.state_dict()
+            if self.algorithm == "sgd":
+                state["hp_gradient_normalizer"] = self.hp_gradient_normalizer.state_dict()
         return state
 
     def load_state_dict(self, state_dict):
@@ -715,10 +715,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._buffers.update({k: (v.to(device=p.device, dtype=p.dtype) if isinstance(v, torch.Tensor) else v)
                               for k, v in state_dict.get("buffers", {}).items()})
         if self.apply_gradient_normalizer:
-             self.heads_gradient_normalizer.load_state_dict(state_dict["heads_gradient_normalizer"])
-             self.encoder_gradient_normalizer.load_state_dict(state_dict["encoder_gradient_normalizer"])
-        if self.algorithm == "sgd":
-             self.hp_gradient_normalizer.load_state_dict(state_dict["hp_gradient_normalizer"])
+            self.heads_gradient_normalizer.load_state_dict(state_dict["heads_gradient_normalizer"])
+            self.encoder_gradient_normalizer.load_state_dict(state_dict["encoder_gradient_normalizer"])
+            if self.algorithm == "sgd":
+                self.hp_gradient_normalizer.load_state_dict(state_dict["hp_gradient_normalizer"])
 
     @torch.no_grad()
     def _gather_grads(self, part):
