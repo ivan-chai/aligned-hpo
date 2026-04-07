@@ -151,6 +151,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.algorithm = algorithm
         self.align = align
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
+        self.eps = eps
 
         if isinstance(ema, Number):
             ema = {k: ema for k in ["covs", "stats"]}
@@ -176,7 +177,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self.hp_gradient_normalizer = GradientNormalizer(clip=self.eps ** 2, momentum=self.stats_momentum)
         self.z_grad_lr = z_grad_lr
         self.maxiters = maxiters
-        self.eps = eps
 
         # TODO: use optimizer state for gradient caches.
         self._running_stats = {"covs": None, "products": None, "weights": None}
