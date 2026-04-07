@@ -426,7 +426,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         all_grads_covs = self._update_running_stats(all_grads_covs, "covs")
         products = self._update_running_stats(products, "products")
 
-        logits = self.logits
         self._buffers["tune_grad_norms"] = grad_norms
         self._buffers["tune_grad_norm_downstream"] = down_grad_norm
 
