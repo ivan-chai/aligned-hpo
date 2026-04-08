@@ -41,6 +41,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
+        scale_gradients: A fixed scale for gradients.
         skip_step_zero_weights_limit: Skip optimizer step, when weights are zero. When the limit reached, continue training with equal weights.
         z_grad_lr: The encoder step size, when encoder-decoder is used with `train-val` alignment.
         maxiters: The maxmum number of iterations in the closed-form solver.
@@ -122,7 +123,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=0, align="train",
-                 apply_optimizer_correction=False,
+                 apply_optimizer_correction=False, scale_gradients=1,
                  skip_step_zero_weights_limit=5, z_grad_lr=0.001, maxiters=100, eps=1e-8):
         params = list(params)
         if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
@@ -173,10 +174,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.weights_momentum = ema["weights"]
         self.stats_momentum = ema["stats"]
 
-        self._normalizers = {name: GradientNormalizer(clip=self.eps ** 2, momentum=self.stats_momentum)
+        self._normalizers = {name: GradientNormalizer(clip=self.eps ** 2,
+                                                      momentum=self.stats_momentum,
+                                                      check_shape=not encoder_decoder)
                              for name in self.weights_names}
 
         self.apply_optimizer_correction = apply_optimizer_correction
+        self.scale_gradients = scale_gradients
         self.z_grad_lr = z_grad_lr
         self.maxiters = maxiters
 
@@ -555,6 +559,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if self.encoder_decoder:
                 # Backprop with z grads. Keep logits grad intact.
                 z_grad = sum([w * grads["all_z_grads"][i] for i, w in enumerate(weights)], self.encoder_downstream_weight * grads["z_down_grads"])
+                if self.scale_gradients != 1:
+                    z_grad *= self.scale_gradients
                 z_grad *= self._running_stats["encoder_transmission"] or 1
                 z_grad_norm = torch.linalg.norm(z_grad)
                 logits_grad = self.logits.grad
@@ -567,6 +573,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self._encoder_grad_norm_tracker.update(encoder_grad_norm)
             else:
                 encoder_grad = sum([w * grads["all_encoder_grads"][i] for i, w in enumerate(weights[:-1])], weights[-1] * grads["all_encoder_grads"][-1])
+                if self.scale_gradients != 1:
+                    encoder_grad *= self.scale_gradients
                 self._encoder_grad_norm_tracker.update(torch.linalg.norm(encoder_grad))
                 if self.downstream_merge:
                     encoder_down_grads = grads["encoder_down_grads"]
@@ -589,6 +597,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
             # Set grads for individual heads model.
             heads_grad = sum(grads["all_heads_grads"], grads["heads_down_grads"])
+            if self.scale_gradients != 1:
+                heads_grad *= self.scale_gradients
             self._heads_grad_norm_tracker.update(torch.linalg.norm(heads_grad))
             offset = 0
             for p in self.param_groups[1]["params"]:

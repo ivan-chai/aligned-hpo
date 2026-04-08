@@ -9,8 +9,9 @@ class GradientNormalizer(torch.nn.Module):
         Normalized gradient norm.
     """
 
-    def __init__(self, clip=1e-2, momentum=0.9):
+    def __init__(self, clip=1e-2, momentum=0.9, check_shape=True):
         super().__init__()
+        self._check_shape = check_shape
         self._momentum = momentum
         self._clip = clip
         self._shape = None
@@ -33,7 +34,7 @@ class GradientNormalizer(torch.nn.Module):
                 norm = self._compute_grad_norm(parameters)
         if self._shape is None:
             self._shape = shape
-        elif self._shape != shape:
+        elif self._check_shape and (self._shape != shape):
             raise ValueError("Gradient shape mismatch")
         if self.moving_norm.device != device:
             self.to(device)
