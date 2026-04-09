@@ -17,7 +17,10 @@ from .stats import StatsTracker
 HPO_STAGE_DOWNSTREAM = "downstream"
 
 
+DEFAULT_EMA_COVS = 0.9
+DEFAULT_EMA_WEIGHTS = 0
 DEFAULT_EMA_STATS = 0.9
+DEFAULT_WARMUP = 10
 
 
 class ZeroWeightsException(Exception):
@@ -39,6 +42,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             This flag affects an intereface of the provided closure. See notes below.
         algorithm: Either "sgd", "mse", or "none" to disable HPO.
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
+        warmup: Average the specified number of initial observation instead of EMA.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         scale_gradients: A fixed scale for gradients.
@@ -122,7 +126,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", encoder_downstream_weight=0, downstream_merge=False,
-                 encoder_decoder=False, algorithm="sgd", ema=0, align="train",
+                 encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP, align="train",
                  apply_optimizer_correction=False, scale_gradients=1,
                  skip_step_zero_weights_limit=5, z_grad_lr=0.001, maxiters=100, eps=1e-8):
         params = list(params)
@@ -159,11 +163,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
         self.eps = eps
 
-        if isinstance(ema, Number):
-            ema = {k: ema for k in ["covs", "stats"]}
+        if ema is None:
+            ema = {}
+        elif isinstance(ema, Number):
+            ema = {"covs": ema}
         ema_defaults = {
-            "covs": 0,
-            "weights": 0,
+            "covs": DEFAULT_EMA_COVS,
+            "weights": DEFAULT_EMA_WEIGHTS,
             "stats": DEFAULT_EMA_STATS
         }
         ema = dict(ema_defaults, **ema)
@@ -173,6 +179,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.covs_momentum = ema["covs"]
         self.weights_momentum = ema["weights"]
         self.stats_momentum = ema["stats"]
+        self.warmup = warmup
 
         self._normalizers = {name: GradientNormalizer(clip=self.eps ** 2,
                                                       momentum=self.stats_momentum,
@@ -191,7 +198,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if (self.align == "train-val") and self.encoder_decoder:
                 self._running_stats["encoder_grads"] = None
         self._buffers = {
-            "n_skipped_steps": 0
+            "n_skipped_steps": 0,
+            "n_updates": 0
         }
 
         self._n_skipped_steps_tracker = StatsTracker("n_skipped_steps", self.stats_momentum)
@@ -256,11 +264,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return weights
 
     def _update_running_stats(self, value, stage=None):
+        warmup = False
         if stage not in self._running_stats:
             raise ValueError(f"Unknown stage: {stage}")
         if stage == "weights":
             momentum = self.weights_momentum
         elif stage in {"covs", "products", "encoder_grads"}:
+            n_updates = self._buffers["n_updates"]
+            warmup = n_updates < self.warmup
             momentum = self.covs_momentum
         elif stage in {"encoder_transmission"}:
             momentum = self.stats_momentum
@@ -269,6 +280,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if self._running_stats[stage] is None:
             self._running_stats[stage] = value
+        elif warmup:
+            self._running_stats[stage] = (self._running_stats[stage] * n_updates + value) / (n_updates + 1)
         else:
             if momentum > 0:
                 value = self._running_stats[stage] * momentum + value * (1 - momentum)
@@ -442,6 +455,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._correlations_tracker.update(products.detach().clone())
         self._weights_tracker.update(weights.detach().clone())
 
+        self._buffers["n_updates"] += 1
         return grads
 
     @torch.no_grad()
