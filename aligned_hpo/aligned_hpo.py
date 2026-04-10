@@ -425,8 +425,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
         if is_distributed:
-            torch.distributed.all_reduce(all_grads_covs, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(products, op=torch.distributed.ReduceOp.SUM)
+            # Merge two all_reduces into one by concatenating tensors.
+            flat = torch.cat([all_grads_covs.flatten(), products])
+            torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+            covs_numel = all_grads_covs.numel()
+            all_grads_covs.copy_(flat[:covs_numel].view_as(all_grads_covs))
+            products.copy_(flat[covs_numel:])
         # Equalize gradient norms.
         reduced_norms = all_grads_covs.diag().sqrt()  # (W).
         all_grads_covs /= reduced_norms[:, None] * reduced_norms[None, :]
@@ -436,13 +440,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         products = self._update_running_stats(products, "products")
 
         weights, logits_grads = self._compute_weights_and_gradients(all_grads_covs, products)
-        if is_distributed:
-            if logits_grads is not None:
-                torch.distributed.all_reduce(logits_grads, op=torch.distributed.ReduceOp.SUM)
-                logits_grads /= torch.distributed.get_world_size()
-            if weights is not None:
-                torch.distributed.all_reduce(weights, op=torch.distributed.ReduceOp.SUM)
-                weights /= torch.distributed.get_world_size()
 
         weights = self._update_running_stats(weights, stage="weights")
 
@@ -572,7 +569,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Set gradients for the encoder model weights.
             if self.encoder_decoder:
                 # Backprop with z grads. Keep logits grad intact.
-                z_grad = sum([w * grads["all_z_grads"][i] for i, w in enumerate(weights)], self.encoder_downstream_weight * grads["z_down_grads"])
+                z_grad = (torch.stack(grads["all_z_grads"]) * weights[:, None]).sum(0)
+                z_grad.add_(self.encoder_downstream_weight * grads["z_down_grads"])
                 if self.scale_gradients != 1:
                     z_grad *= self.scale_gradients
                 z_grad *= self._running_stats["encoder_transmission"] or 1
@@ -586,7 +584,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self._update_running_stats(z_grad_norm / encoder_grad_norm.clamp(min=self.eps ** 2), stage="encoder_transmission")
                 self._encoder_grad_norm_tracker.update(encoder_grad_norm)
             else:
-                encoder_grad = sum([w * grads["all_encoder_grads"][i] for i, w in enumerate(weights[:-1])], weights[-1] * grads["all_encoder_grads"][-1])
+                encoder_grad = (torch.stack(grads["all_encoder_grads"]) * weights[:, None]).sum(0)
                 if self.scale_gradients != 1:
                     encoder_grad *= self.scale_gradients
                 self._encoder_grad_norm_tracker.update(torch.linalg.norm(encoder_grad))
@@ -610,7 +608,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del encoder_grad
 
             # Set grads for individual heads model.
-            heads_grad = sum(grads["all_heads_grads"], grads["heads_down_grads"])
+            heads_grad = torch.stack(grads["all_heads_grads"]).sum(0).add_(grads["heads_down_grads"])
             if self.scale_gradients != 1:
                 heads_grad *= self.scale_gradients
             self._heads_grad_norm_tracker.update(torch.linalg.norm(heads_grad))
