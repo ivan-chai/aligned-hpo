@@ -206,8 +206,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._weights_tracker = StatsTracker("weights", self.stats_momentum)
         self._heads_grad_norm_tracker = StatsTracker("heads_grad_norm", self.stats_momentum)
         self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.stats_momentum)
-        if self.algorithm != "none":
-            self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum)
+        self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum)
 
     @property
     def use_validation(self):
@@ -222,7 +221,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         result = {}
         for name, c in zip(self.weights_names, self.logits):
             result[f"logits_{name}"] = c
-        if (self.algorithm not in {"none"}) and (self._correlations_tracker.last_value is not None):
+        if self._correlations_tracker.last_value is not None:
             for key, val in self._correlations_tracker.get().items():
                 for wname, c in zip(self.weights_names, val):
                     result[f"{key}_{wname}"] = c
@@ -443,11 +442,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         weights = self._update_running_stats(weights, stage="weights")
 
-        if logits_grads is None:
+        self.logits.grad = logits_grads
+        if (logits_grads is None) and (self.algorithm != "none"):
             self.logits.copy_(weights)
-            self.logits.grad = None
-        else:
-            self.logits.grad = logits_grads
 
         self._correlations_tracker.update(products.detach().clone())
         self._weights_tracker.update(weights.detach().clone())
@@ -655,8 +652,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state["weights_tracker"] = self._weights_tracker.state_dict()
         state["heads_grad_norm_tracker"] = self._heads_grad_norm_tracker.state_dict()
         state["encoder_grad_norm_tracker"] = self._encoder_grad_norm_tracker.state_dict()
-        if self.algorithm != "none":
-            state["correlations_tracker"] = self._correlations_tracker.state_dict()
+        state["correlations_tracker"] = self._correlations_tracker.state_dict()
         return state
 
     def load_state_dict(self, state_dict):
@@ -677,8 +673,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._heads_grad_norm_tracker.load_state_dict(state_dict["heads_grad_norm_tracker"])
         if "encoder_grad_norm_tracker" in state_dict:
             self._encoder_grad_norm_tracker.load_state_dict(state_dict["encoder_grad_norm_tracker"])
-        if self.algorithm != "none":
-            self._correlations_tracker.load_state_dict(state_dict["correlations_tracker"])
+        self._correlations_tracker.load_state_dict(state_dict["correlations_tracker"])
 
     @torch.no_grad()
     def _gather_grads(self, part):
