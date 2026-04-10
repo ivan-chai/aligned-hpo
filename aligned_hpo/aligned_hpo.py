@@ -569,11 +569,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Set gradients for the encoder model weights.
             if self.encoder_decoder:
                 # Backprop with z grads. Keep logits grad intact.
-                z_grad = (torch.stack(grads["all_z_grads"]) * weights[:, None]).sum(0)
-                z_grad.add_(self.encoder_downstream_weight * grads["z_down_grads"])
-                if self.scale_gradients != 1:
-                    z_grad *= self.scale_gradients
-                z_grad *= self._running_stats["encoder_transmission"] or 1
+                scale = self.scale_gradients * (self._running_stats["encoder_transmission"] or 1)
+                z_grad = (scale * weights) @ torch.stack(grads["all_z_grads"])
+                z_grad.add_((scale * self.encoder_downstream_weight) * grads["z_down_grads"])
                 z_grad_norm = torch.linalg.norm(z_grad)
                 logits_grad = self.logits.grad
                 self.logits.grad = None
@@ -584,7 +582,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self._update_running_stats(z_grad_norm / encoder_grad_norm.clamp(min=self.eps ** 2), stage="encoder_transmission")
                 self._encoder_grad_norm_tracker.update(encoder_grad_norm)
             else:
-                encoder_grad = (torch.stack(grads["all_encoder_grads"]) * weights[:, None]).sum(0)
+                encoder_grad = weights @ torch.stack(grads["all_encoder_grads"])
                 if self.scale_gradients != 1:
                     encoder_grad *= self.scale_gradients
                 self._encoder_grad_norm_tracker.update(torch.linalg.norm(encoder_grad))
