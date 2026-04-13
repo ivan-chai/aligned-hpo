@@ -38,6 +38,11 @@ class GradientNormalizer(torch.nn.Module):
             raise ValueError("Gradient shape mismatch")
         if self.moving_norm.device != device:
             self.to(device)
+        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
+        if is_distributed:
+            # We use triangle inequality and approximate norm of the mean with mean of the norms.
+            torch.distributed.all_reduce(norm, op=torch.distributed.ReduceOp.SUM)
+            norm /= torch.distributed.get_world_size()
         with torch.no_grad():
             momentum = 0 if self._is_first else self._momentum
             self.moving_norm.fill_(self.moving_norm * momentum + (1 - momentum) * norm)
