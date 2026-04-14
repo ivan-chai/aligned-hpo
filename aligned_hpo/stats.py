@@ -2,9 +2,10 @@ import torch
 
 
 class StatsTracker:
-    def __init__(self, name, ema):
+    def __init__(self, name, ema, track_median=True):
         self.name = name
         self.ema = ema
+        self.track_median = track_median
         self.n_updates = 0
         self.last_value = None
         self.ema_value = None
@@ -152,16 +153,19 @@ class StatsTracker:
         else:
             self.ema_value = self.ema_value * self.ema + value * (1 - self.ema)
             self.avg_value = (self.avg_value * (self.n_updates - 1) + value) / self.n_updates
-        self._p2_update(value)
+        if self.track_median:
+            self._p2_update(value)
 
     def get(self):
         name = self.name
-        return {
+        result = {
             f"{name}": self.last_value,
             f"ema_{name}": self.ema_value,
             f"avg_{name}": self.avg_value,
-            f"median_{name}": self.median_value,
         }
+        if self.track_median:
+            result[f"median_{name}"] = self.median_value
+        return result
 
     def state_dict(self):
         p2_q = self._p2_q.clone() if isinstance(self._p2_q, torch.Tensor) else list(self._p2_q) if self._p2_q is not None else None

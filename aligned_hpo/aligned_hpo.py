@@ -202,11 +202,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             "n_updates": 0
         }
 
-        self._n_skipped_steps_tracker = StatsTracker("n_skipped_steps", self.stats_momentum)
+        self._n_skipped_steps_tracker = StatsTracker("n_skipped_steps", self.stats_momentum, track_median=False)
         self._weights_tracker = StatsTracker("weights", self.stats_momentum)
-        self._heads_grad_norm_tracker = StatsTracker("heads_grad_norm", self.stats_momentum)
-        self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.stats_momentum)
-        self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum)
+        self._heads_grad_norm_tracker = StatsTracker("heads_grad_norm", self.stats_momentum, track_median=False)
+        self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.stats_momentum, track_median=False)
+        self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum, track_median=False)
 
     @property
     def use_validation(self):
