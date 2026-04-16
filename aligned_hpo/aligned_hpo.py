@@ -235,6 +235,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             result.update(self._heads_grad_norm_tracker.get())
         if self._encoder_grad_norm_tracker.last_value is not None:
             result.update(self._encoder_grad_norm_tracker.get())
+        for name, normalizer in self._normalizers.items():
+            if not normalizer.is_first:
+                result[f"moving_norm_{name}"] = normalizer.moving_norm
         if self.encoder_decoder and (self._running_stats["encoder_transmission"] is not None):
             result["encoder_transmission"] = self._running_stats["encoder_transmission"]
         return result

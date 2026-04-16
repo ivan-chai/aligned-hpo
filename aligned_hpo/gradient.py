@@ -18,6 +18,10 @@ class GradientNormalizer(torch.nn.Module):
         self._is_first = True
         self.register_buffer("moving_norm", torch.zeros([]))
 
+    @property
+    def is_first(self):
+        return self._is_first
+
     def forward(self, parameters):
         if isinstance(parameters, torch.Tensor):
             shape = list(parameters.shape)
