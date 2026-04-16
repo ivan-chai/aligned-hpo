@@ -44,6 +44,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
         warmup: Average the specified number of initial observation instead of EMA.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
+        regularization: Regularization weight for the SGD algorithm. Logits are kept close to 1.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         scale_gradients: A fixed scale for gradients.
         skip_step_zero_weights_limit: Skip optimizer step, when weights are zero. When the limit reached, continue training with equal weights.
@@ -127,7 +128,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
                  weights_parametrization="abs", encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP, align="train",
-                 apply_optimizer_correction=False, scale_gradients=1,
+                 regularization=0, apply_optimizer_correction=False, scale_gradients=1,
                  skip_step_zero_weights_limit=5, z_grad_lr=0.001, maxiters=100, eps=1e-8):
         params = list(params)
         if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
@@ -160,6 +161,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
         self.align = align
+        self.regularization = regularization
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
         self.eps = eps
 
@@ -355,6 +357,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # propagating through the normalization graph when gradients are small.
             self.logits.grad = None
             weights.backward(-products)
+            if self.regularization != 0:
+                with torch.enable_grad():
+                    regularization = (torch.linalg.norm(self.logits) - 1).square()
+                    (regularization * self.regularization).backward()
             return weights, self.logits.grad.clone()
         elif self.algorithm == "mse":
             if self.weights_parametrization == "abs":
