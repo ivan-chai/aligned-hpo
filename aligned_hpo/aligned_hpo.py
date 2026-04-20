@@ -34,6 +34,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         params: Model parameters with 3 or more groups. See parameter groups note below.
         base_optimizer_cls: The optimizer to use.
         base_optimizer_params: Parameters of the base optimizer.
+        heads_groups: Indices of parameter groups, related to individual loss heads.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
         encoder_downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
@@ -125,7 +126,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     optimizer.hpo_step(closure, closure_encoder)
     ```
     """
-    def __init__(self, params, base_optimizer_cls, base_optimizer_params=None, weights_names=None,
+    def __init__(self, params, base_optimizer_cls,
+                 base_optimizer_params=None, heads_groups=(1,), weights_names=None,
                  weights_parametrization="abs", encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP, align="train",
                  regularization=0, apply_optimizer_correction=False, scale_gradients=1,
@@ -147,6 +149,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.param_groups = self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
 
+        if 0 in heads_groups:
+            raise ValueError("The first group (index 0) is reserved for weights and can not relate to individual heads.")
+        self.heads_groups = list(sorted(set(heads_groups)))
+        encoder_groups = set(range(len(self.param_groups))) - {0} - set(heads_groups)
+        self.encoder_groups = list(sorted(encoder_groups))
         self.n_weights = len(self.logits)
         if weights_names is None:
             weights_names = [str(i) for i in range(self.n_weights)]
@@ -603,7 +610,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     encoder_grad = torch.where(mask, encoder_down_grads, encoder_grad)
                     encoder_down_grads.masked_fill_(mask, 0)
                     del mask
-                param_groups = self.param_groups[2:]
+                param_groups = [self.param_groups[i] for i in self.encoder_groups]
                 downstream_weight = self.encoder_downstream_weight
                 offset = 0
                 for i, group in enumerate(param_groups):
@@ -622,10 +629,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 heads_grad *= self.scale_gradients
             self._heads_grad_norm_tracker.update(torch.linalg.norm(heads_grad))
             offset = 0
-            for p in self.param_groups[1]["params"]:
-                numel = p.numel()
-                p.grad = heads_grad[offset:offset + numel].reshape(p.shape)
-                offset += numel
+            for i in self.heads_groups:
+                for p in self.param_groups[i]["params"]:
+                    numel = p.numel()
+                    p.grad = heads_grad[offset:offset + numel].reshape(p.shape)
+                    offset += numel
             assert offset == len(heads_grad)
             del heads_grad
 
@@ -643,7 +651,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     @contextmanager
     def _tmp_encoder_update(self, grads, lr):
         """Save encoder parameters on entry and restore them on exit."""
-        encoder_params = [p for group in self.param_groups[2:] for p in group["params"]]
+        encoder_params = [p for i in self.encoder_groups for p in self.param_groups[i]["params"]]
         saved = [p.data.clone() for p in encoder_params]
         try:
             offset = 0
@@ -703,11 +711,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if part == "all":
             param_groups = self.param_groups[1:]
         elif part == "heads":
-            param_groups = [self.param_groups[1]]
+            param_groups = [self.param_groups[i] for i in self.heads_groups]
         else:
             assert part == "encoder"
             # All except hyperparameters and individual heads.
-            param_groups = self.param_groups[2:]
+            param_groups = [self.param_groups[i] for i in self.encoder_groups]
         grads = []
         for group in param_groups:
             for p in group["params"]:
@@ -723,11 +731,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if part == "all":
             param_groups = self.param_groups[1:]
         elif part == "heads":
-            param_groups = [self.param_groups[1]]
+            param_groups = [self.param_groups[i] for i in self.heads_groups]
         else:
             assert part == "encoder"
             # All except hyperparameters and individual heads.
-            param_groups = self.param_groups[2:]
+            param_groups = [self.param_groups[i] for i in self.encoder_groups]
         if isinstance(self.base_optimizer, torch.optim.Adam):
             offset = 0
             for group in param_groups:
