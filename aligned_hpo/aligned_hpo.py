@@ -611,6 +611,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 grads = self._tune_weights(closure, embed_fn=embed_fn)
             weights = self._running_stats["weights"]
 
+            if weights is None:
+                raise RuntimeError("Validation batch must be consumed first, when align is val")
+
             if (self.algorithm not in {"sgd", "warmup-sgd"}) and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(weights) < self.eps):
                 skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
