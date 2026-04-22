@@ -399,7 +399,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return weights, None
         else:
             assert algorithm == "none"
-            weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+            weights = self._unnormalized_weights
             return weights, None
 
     @torch.no_grad()
