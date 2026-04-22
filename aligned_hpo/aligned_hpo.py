@@ -45,6 +45,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
         warmup: Average the specified number of initial observation instead of EMA.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
+        train_downstream_head: Which dataset use to train the downstream head. Either "train", "val", or "train-val".
         regularization: Regularization weight for the SGD algorithm. Logits are kept close to 1.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         scale_gradients: A fixed scale for gradients.
@@ -129,7 +130,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls,
                  base_optimizer_params=None, heads_groups=(1,), weights_names=None,
                  weights_parametrization="abs", encoder_downstream_weight=0, downstream_merge=False,
-                 encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP, align="train",
+                 encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
+                 align="train", train_downstream_head="train",
                  regularization=0, apply_optimizer_correction=False, scale_gradients=1,
                  skip_step_zero_weights_limit=5, z_grad_lr=0.001, maxiters=100, eps=1e-8):
         params = list(params)
@@ -143,6 +145,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
         if align not in ["train", "val", "train-val"]:
             raise ValueError(f"Unknown align mode: {align}")
+        if train_downstream_head not in ["train", "val", "train-val"]:
+            raise ValueError(f"Unknown train downstream head mode: {train_downstream_head}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
         self.base_optimizer = base_optimizer_cls(self.param_groups, **(base_optimizer_params or {}))
@@ -168,6 +172,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
         self.align = align
+        self.train_downstream_head = train_downstream_head
         self.regularization = regularization
         self.skip_step_zero_weights_limit = skip_step_zero_weights_limit
         self.eps = eps
@@ -532,25 +537,45 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         # Tune weights.
         assert self.align == "val"
         output_weights = torch.empty_like(self.logits)
+        grads_ref = [None]
 
         @torch.no_grad()
         def inner_closure():
-            self._tune_weights(closure, embed_fn=embed_fn)
+            grads_ref[0] = self._tune_weights(closure, embed_fn=embed_fn)
             output_weights.copy_(self._running_stats["weights"])
 
             if after_backward_hook is not None:
                 after_backward_hook()
 
-            for group in self.param_groups[1:]:
-                for p in group["params"]:
-                    p.grad = None
+            if self.train_downstream_head in {"val", "train-val"}:
+                # Apply downstream head gradients; zero encoder grads only.
+                heads_down_grads = grads_ref[0]["heads_down_grads"]
+                if self.scale_gradients != 1:
+                    heads_down_grads = heads_down_grads * self.scale_gradients
+                offset = 0
+                for i in self.heads_groups:
+                    for p in self.param_groups[i]["params"]:
+                        numel = p.numel()
+                        p.grad = heads_down_grads[offset:offset + numel].reshape(p.shape)
+                        offset += numel
+                encoder_group_indices = set(range(len(self.param_groups))) - {0} - set(self.heads_groups)
+                for i in encoder_group_indices:
+                    for p in self.param_groups[i]["params"]:
+                        p.grad = None
+            else:
+                for group in self.param_groups[1:]:
+                    for p in group["params"]:
+                        p.grad = None
+
         if self.algorithm in {"sgd", "warmup-sgd"}:
-            # Use optimizer.
+            # Use optimizer — also applies head grads when train_downstream_head is "val" or "train-val".
             self.step(inner_closure, inner=True)
         else:
             # Closed-form computation.
             assert self.algorithm in {"mse", "none"}
             inner_closure()
+            if self.train_downstream_head in {"val", "train-val"}:
+                self.step(inner=True)
         return output_weights
 
     @torch.no_grad()
@@ -640,7 +665,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del encoder_grad
 
             # Set grads for individual heads model.
-            heads_grad = torch.stack(grads["all_heads_grads"]).sum(0).add_(grads["heads_down_grads"])
+            heads_grad = torch.stack(grads["all_heads_grads"]).sum(0)
+            if self.train_downstream_head in {"train", "train-val"}:
+                heads_grad.add_(grads["heads_down_grads"])
             if self.scale_gradients != 1:
                 heads_grad *= self.scale_gradients
             self._heads_grad_norm_tracker.update(torch.linalg.norm(heads_grad))
