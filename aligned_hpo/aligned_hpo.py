@@ -213,6 +213,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         self._n_skipped_steps_tracker = StatsTracker("n_skipped_steps", self.stats_momentum, track_median=False)
         self._weights_tracker = StatsTracker("weights", self.stats_momentum)
+        self._effective_weights_tracker = StatsTracker("effective_weights", self.stats_momentum)
         self._heads_grad_norm_tracker = StatsTracker("heads_grad_norm", self.stats_momentum, track_median=False)
         self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.stats_momentum, track_median=False)
         self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum, track_median=False)
@@ -236,6 +237,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     result[f"{key}_{wname}"] = c
         if self._weights_tracker.last_value is not None:
             for key, val in self._weights_tracker.get().items():
+                for wname, c in zip(self.weights_names, val):
+                    result[f"{key}_{wname}"] = c
+        if self._effective_weights_tracker.last_value is not None:
+            for key, val in self._effective_weights_tracker.get().items():
                 for wname, c in zip(self.weights_names, val):
                     result[f"{key}_{wname}"] = c
         if self._n_skipped_steps_tracker.last_value is not None:
@@ -470,6 +475,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._correlations_tracker.update(products.detach().clone())
         self._weights_tracker.update(weights.detach().clone())
 
+        moving_norms = []
+        for name in self.weights_names:
+            normalizer = self._normalizers[name]
+            if normalizer.is_first:
+                break
+            moving_norms.append(normalizer.moving_norm)
+        else:
+            moving_norms = torch.stack(moving_norms).clamp(min=self.eps)
+            effective_weights = weights / moving_norms * (self._running_stats.get("encoder_transmission", None) or 1)
+            self._effective_weights_tracker.update(effective_weights.detach().clone())
+
         self._buffers["n_updates"] += 1
         return grads
 
@@ -672,6 +688,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state["normalizers"] = {k: v.state_dict() for k, v in self._normalizers.items()}
         state["n_skipped_steps_tracker"] = self._n_skipped_steps_tracker.state_dict()
         state["weights_tracker"] = self._weights_tracker.state_dict()
+        state["effective_weights_tracker"] = self._effective_weights_tracker.state_dict()
         state["heads_grad_norm_tracker"] = self._heads_grad_norm_tracker.state_dict()
         state["encoder_grad_norm_tracker"] = self._encoder_grad_norm_tracker.state_dict()
         state["correlations_tracker"] = self._correlations_tracker.state_dict()
@@ -691,6 +708,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._n_skipped_steps_tracker.load_state_dict(state_dict["n_skipped_steps_tracker"])
         if "weights_tracker" in state_dict:
             self._weights_tracker.load_state_dict(state_dict["weights_tracker"])
+        if "effective_weights_tracker" in state_dict:
+            self._effective_weights_tracker.load_state_dict(state_dict["effective_weights_tracker"])
         if "heads_grad_norm_tracker" in state_dict:
             self._heads_grad_norm_tracker.load_state_dict(state_dict["heads_grad_norm_tracker"])
         if "encoder_grad_norm_tracker" in state_dict:
