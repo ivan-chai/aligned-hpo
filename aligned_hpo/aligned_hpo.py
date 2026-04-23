@@ -711,8 +711,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             for p, saved_data in zip(encoder_params, saved):
                 p.data.copy_(saved_data)
 
-    def hpo_state_dict(self):
+    def hpo_state_dict(self, add_names=False):
         state = {}
+        if add_names:
+            state["weights_names"] = self.weights_names
         state["running_stats"] = dict(self._running_stats)
         state["buffers"] = dict(self._buffers)
         state["normalizers"] = {k: v.state_dict() for k, v in self._normalizers.items()}
