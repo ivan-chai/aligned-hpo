@@ -711,8 +711,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             for p, saved_data in zip(encoder_params, saved):
                 p.data.copy_(saved_data)
 
-    def state_dict(self):
-        state = self.base_optimizer.state_dict()
+    def hpo_state_dict(self):
+        state = {}
         state["running_stats"] = dict(self._running_stats)
         state["buffers"] = dict(self._buffers)
         state["normalizers"] = {k: v.state_dict() for k, v in self._normalizers.items()}
@@ -722,6 +722,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state["heads_grad_norm_tracker"] = self._heads_grad_norm_tracker.state_dict()
         state["encoder_grad_norm_tracker"] = self._encoder_grad_norm_tracker.state_dict()
         state["correlations_tracker"] = self._correlations_tracker.state_dict()
+        return state
+
+    def state_dict(self):
+        state = self.base_optimizer.state_dict()
+        state.update(self.hpo_state_dict())
         return state
 
     def load_state_dict(self, state_dict):
