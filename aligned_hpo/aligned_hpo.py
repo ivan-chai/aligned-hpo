@@ -37,6 +37,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         heads_groups: Indices of parameter groups, related to individual loss heads.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
+        rescale_encoder_grad_norm_weights: If provided, scale gradients to match the norm of the training with the specified weights.
         encoder_downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
@@ -129,7 +130,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls,
                  base_optimizer_params=None, heads_groups=(1,), weights_names=None,
-                 weights_parametrization="abs", weights_normalization="grad-norm", weights_normalization_basis=None,
+                 weights_parametrization="abs", rescale_encoder_grad_norm_weights=None,
                  encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
                  align="train", train_downstream_head="train",
@@ -144,8 +145,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
-        if weights_normalization not in ["grad-norm", "grad-norm-scaled"]:
-            raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         if align not in ["train", "val", "train-val"]:
             raise ValueError(f"Unknown align mode: {align}")
         if train_downstream_head not in ["train", "val", "train-val"]:
@@ -170,14 +169,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.n_weights == 0:
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
-        self.weights_normalization = weights_normalization
 
-        if weights_normalization_basis is not None:
-            weights_normalization_basis = torch.tensor(weights_normalization_basis, device=self.logits.device, dtype=self.logits.dtype)
-        else:
-            weights_normalization_basis = torch.ones_like(self.logits)
-        assert len(weights_normalization_basis) == len(self.logits)
-        self.weights_normalization_basis = weights_normalization_basis
+        if rescale_encoder_grad_norm_weights is not None:
+            rescale_encoder_grad_norm_weights = torch.tensor(rescale_encoder_grad_norm_weights, device=self.logits.device, dtype=self.logits.dtype)
+            assert len(rescale_encoder_grad_norm_weights) == len(self.logits)
+        self.rescale_encoder_grad_norm_weights = rescale_encoder_grad_norm_weights
         self.encoder_downstream_weight = encoder_downstream_weight
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
@@ -294,19 +290,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if torch.linalg.norm(weights) < self.eps ** 2:
             return weights
         pretrain_covariances = pretrain_covariances.detach()
-        weights_grad_norm_sq = weights[None] @ pretrain_covariances @ weights
-        if self.weights_normalization == "grad-norm":
-            weights = weights / weights_grad_norm_sq.sqrt().clamp(min=self.eps ** 2)
-        elif self.weights_normalization == "grad-norm-scaled":
-            if self.weights_normalization_basis.device != weights.device:
-                self.weights_normalization_basis = self.weights_normalization_basis.to(weights.device)
-            moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
-            basis = self.weights_normalization_basis * moving_norms
-            basis_grad_norm_sq = basis[None] @ pretrain_covariances @ basis
-            scale = (basis_grad_norm_sq / weights_grad_norm_sq).sqrt()
-            weights = weights * scale
-        else:
-            assert False
+        weights_grad_norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
+        weights = weights / weights_grad_norm.clamp(min=self.eps ** 2)
         return weights
 
     def _update_running_stats(self, value, stage=None):
@@ -422,7 +407,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 weights = torch.zeros_like(self.logits)
             else:
                 weights = solve_qcqp(all_grads_covs, products, positive=positive)
-            weights = self._normalize_weights(weights, pretrain_covariances=all_grads_covs)
             return weights, None
         else:
             assert algorithm == "none"
@@ -495,6 +479,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         all_grads_covs = self._update_running_stats(all_grads_covs, "covs")
         products = self._update_running_stats(products, "products")
+        grads["all_grads_covs"] = all_grads_covs
 
         weights, logits_grads = self._compute_weights_and_gradients(all_grads_covs, products)
 
@@ -656,9 +641,19 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             output_weights.copy_(weights)
 
             # Set gradients for the encoder model weights.
+            if self.rescale_encoder_grad_norm_weights is not None:
+                if self.rescale_encoder_grad_norm_weights.device != weights.device:
+                    self.rescale_encoder_grad_norm_weights = self.rescale_encoder_grad_norm_weights.to(weights.device)
+                moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
+                basis = self.rescale_encoder_grad_norm_weights * moving_norms
+                encoder_grads_scale = (basis[None] @ grads["all_grads_covs"].detach() @ basis).sqrt()
+            else:
+                encoder_grads_scale = 1
             if self.encoder_decoder:
                 # Backprop with z grads. Keep logits grad intact.
-                scale = self.scale_gradients * (self._running_stats["encoder_transmission"] or 1)
+                if self.rescale_encoder_grad_norm_weights is None:
+                    encoder_grads_scale *= (self._running_stats["encoder_transmission"] or 1)
+                scale = encoder_grads_scale * self.scale_gradients
                 z_grad = (scale * weights) @ torch.stack(grads["all_z_grads"])
                 z_grad.add_((scale * self.encoder_downstream_weight) * grads["z_down_grads"])
                 z_grad_norm = torch.linalg.norm(z_grad)
@@ -672,17 +667,16 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 self._encoder_grad_norm_tracker.update(encoder_grad_norm)
             else:
                 encoder_grad = weights @ torch.stack(grads["all_encoder_grads"])
-                if self.scale_gradients != 1:
-                    encoder_grad *= self.scale_gradients
+                encoder_grad *= self.scale_gradients * encoder_grads_scale
                 self._encoder_grad_norm_tracker.update(torch.linalg.norm(encoder_grad))
                 if self.downstream_merge:
-                    encoder_down_grads = grads["encoder_down_grads"]
+                    encoder_down_grads = self.scale_gradients * encoder_grads_scale * grads["encoder_down_grads"]
                     mask = encoder_grad == 0
                     encoder_grad = torch.where(mask, encoder_down_grads, encoder_grad)
                     encoder_down_grads.masked_fill_(mask, 0)
                     del mask
                 param_groups = [self.param_groups[i] for i in self.encoder_groups]
-                downstream_weight = self.encoder_downstream_weight
+                downstream_weight = self.encoder_downstream_weight * self.scale_gradients * encoder_grads_scale
                 offset = 0
                 for i, group in enumerate(param_groups):
                     for p in group["params"]:
