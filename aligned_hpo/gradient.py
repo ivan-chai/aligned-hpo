@@ -17,6 +17,7 @@ class GradientNormalizer(torch.nn.Module):
         self._shape = None
         self._is_first = True
         self.register_buffer("moving_norm", torch.zeros([]))
+        self.register_buffer("last_norm", torch.zeros([]))
 
     @property
     def is_first(self):
@@ -47,6 +48,7 @@ class GradientNormalizer(torch.nn.Module):
             # We use triangle inequality and approximate norm of the mean with mean of the norms.
             torch.distributed.all_reduce(norm, op=torch.distributed.ReduceOp.SUM)
             norm /= torch.distributed.get_world_size()
+        self.last_norm.fill_(norm)
         with torch.no_grad():
             momentum = 0 if self._is_first else self._momentum
             self.moving_norm.fill_(self.moving_norm * momentum + (1 - momentum) * norm)

@@ -199,6 +199,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                                                       momentum=self.stats_momentum,
                                                       check_shape=not encoder_decoder)
                              for name in self.weights_names}
+        self._normalizers_trackers = {name: StatsTracker(f"grad_norm_{name}", self.stats_momentum, track_median=True)
+                                      for name in self.weights_names}
 
         self.apply_optimizer_correction = apply_optimizer_correction
         self.scale_gradients = scale_gradients
@@ -257,6 +259,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         for name, normalizer in self._normalizers.items():
             if not normalizer.is_first:
                 result[f"moving_norm_{name}"] = normalizer.moving_norm
+                result.update(self._normalizers_trackers[name].get())
         if self.encoder_decoder and (self._running_stats["encoder_transmission"] is not None):
             result["encoder_transmission"] = self._running_stats["encoder_transmission"]
         return result
@@ -353,6 +356,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 encoder_grads = self._gather_grads("encoder")
                 self._normalizers[name](encoder_grads)
                 all_encoder_grads.append(encoder_grads)
+            self._normalizers_trackers[name].update(self._normalizers[name].last_norm)
             all_heads_grads.append(heads_grads)
 
         return {
@@ -718,6 +722,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state["running_stats"] = dict(self._running_stats)
         state["buffers"] = dict(self._buffers)
         state["normalizers"] = {k: v.state_dict() for k, v in self._normalizers.items()}
+        state["normalizers_trackers"] = {k: v.state_dict() for k, v in self._normalizers_trackers.items()}
         state["n_skipped_steps_tracker"] = self._n_skipped_steps_tracker.state_dict()
         state["weights_tracker"] = self._weights_tracker.state_dict()
         state["effective_weights_tracker"] = self._effective_weights_tracker.state_dict()
@@ -741,6 +746,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                               for k, v in state_dict.get("buffers", {}).items()})
         for k, v in state_dict["normalizers"].items():
             self._normalizers[k].load_state_dict(v)
+        for k, v in state_dict["normalizers_trackers"].items():
+            self._normalizers_trackers[k].load_state_dict(v)
         if "n_skipped_steps_tracker" in state_dict:
             self._n_skipped_steps_tracker.load_state_dict(state_dict["n_skipped_steps_tracker"])
         if "weights_tracker" in state_dict:
