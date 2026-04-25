@@ -171,6 +171,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
         self.weights_normalization = weights_normalization
+
+        if weights_normalization_basis is not None:
+            weights_normalization_basis = torch.tensor(weights_normalization_basis, device=self.logits.device, dtype=self.logits.dtype)
+        else:
+            weights_normalization_basis = torch.ones_like(self.logits)
+        assert len(weights_normalization_basis) == len(self.logits)
         self.weights_normalization_basis = weights_normalization_basis
         self.encoder_downstream_weight = encoder_downstream_weight
         self.downstream_merge = downstream_merge
@@ -292,12 +298,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.weights_normalization == "grad-norm":
             weights = weights / weights_grad_norm_sq.sqrt().clamp(min=self.eps ** 2)
         elif self.weights_normalization == "grad-norm-scaled":
-            if self.weights_normalization_basis is not None:
-                basis = torch.tensor(self.weights_normalization_basis, device=weights.device, dtype=weights.dtype)
-            else:
-                basis = torch.ones_like(weights)
+            if self.weights_normalization_basis.device != weights.device:
+                self.weights_normalization_basis = self.weights_normalization_basis.to(weights.device)
             moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
-            basis = basis * moving_norms
+            basis = self.weights_normalization_basis * moving_norms
             basis_grad_norm_sq = basis[None] @ pretrain_covariances @ basis
             scale = (basis_grad_norm_sq / weights_grad_norm_sq).sqrt()
             weights = weights * scale
