@@ -129,7 +129,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls,
                  base_optimizer_params=None, heads_groups=(1,), weights_names=None,
-                 weights_parametrization="abs", encoder_downstream_weight=0, downstream_merge=False,
+                 weights_parametrization="abs", weights_normalization="grad-norm", weights_normalization_basis=None,
+                 encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
                  align="train", train_downstream_head="train",
                  regularization=0, apply_optimizer_correction=False, scale_gradients=1,
@@ -143,6 +144,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
+        if weights_normalization not in ["grad-norm", "grad-norm-scaled"]:
+            raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         if align not in ["train", "val", "train-val"]:
             raise ValueError(f"Unknown align mode: {align}")
         if train_downstream_head not in ["train", "val", "train-val"]:
@@ -167,6 +170,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.n_weights == 0:
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
+        self.weights_normalization = weights_normalization
+        self.weights_normalization_basis = weights_normalization_basis
         self.encoder_downstream_weight = encoder_downstream_weight
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
@@ -283,8 +288,21 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if torch.linalg.norm(weights) < self.eps ** 2:
             return weights
         pretrain_covariances = pretrain_covariances.detach()
-        norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
-        weights = weights / norm.clamp(min=self.eps ** 2)
+        weights_grad_norm_sq = weights[None] @ pretrain_covariances @ weights
+        if self.weights_normalization == "grad-norm":
+            weights = weights / weights_grad_norm_sq.sqrt().clamp(min=self.eps ** 2)
+        elif self.weights_normalization == "grad-norm-scaled":
+            if self.weights_normalization_basis is not None:
+                basis = torch.tensor(self.weights_normalization_basis, device=weights.device, dtype=weights.dtype)
+            else:
+                basis = torch.ones_like(weights)
+            moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
+            basis = basis * moving_norms
+            basis_grad_norm_sq = basis[None] @ pretrain_covariances @ basis
+            scale = (basis_grad_norm_sq / weights_grad_norm_sq).sqrt()
+            weights = weights * scale
+        else:
+            assert False
         return weights
 
     def _update_running_stats(self, value, stage=None):
@@ -400,6 +418,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 weights = torch.zeros_like(self.logits)
             else:
                 weights = solve_qcqp(all_grads_covs, products, positive=positive)
+            weights = self._normalize_weights(weights, pretrain_covariances=all_grads_covs)
             return weights, None
         else:
             assert algorithm == "none"
