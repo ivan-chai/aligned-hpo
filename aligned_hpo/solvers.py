@@ -105,7 +105,10 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, rcond=1e-8, max_iter=100, eps=1e
         bS = b_s[S_list]
 
         # Reduced solve on the active set.
-        y = np.linalg.lstsq(CS, bS, rcond=rcond)[0]
+        try:
+            y = np.linalg.lstsq(CS, bS, rcond=rcond)[0]
+        except np.linalg.LinAlgError:
+            break
 
         # Remove nonpositive components from the active set.
         keep = y > tol
