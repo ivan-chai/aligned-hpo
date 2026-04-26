@@ -404,14 +404,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if algorithm in {"sgd", "scaled-sgd"}:
             with torch.enable_grad():
-                weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+                unnormalized_weights = self._unnormalized_weights
+                weights = self._normalize_weights(unnormalized_weights, pretrain_covariances=all_grads_covs)
             # Normalize products before backward to avoid tiny gradient magnitudes
             # propagating through the normalization graph when gradients are small.
             self.logits.grad = None
             weights.backward(-products)
             if self.regularization != 0:
                 with torch.enable_grad():
-                    regularization = (torch.linalg.norm(self.logits) - 1).square()
+                    regularization = (torch.linalg.norm(unnormalized_weights) - 1).square()
                     (regularization * self.regularization).backward()
             return weights, self.logits.grad.clone()
         elif algorithm == "mse":
