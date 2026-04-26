@@ -34,6 +34,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         params: Model parameters with 3 or more groups. See parameter groups note below.
         base_optimizer_cls: The optimizer to use.
         base_optimizer_params: Parameters of the base optimizer.
+        weights_optimizer_cls: The optimizer to use for weights. By default equal to base_optimizer_cls.
+        weights_optimizer_params: Parameters of the weights optimizer.
         heads_groups: Indices of parameter groups, related to individual loss heads.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
@@ -128,8 +130,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     optimizer.hpo_step(closure, closure_encoder)
     ```
     """
-    def __init__(self, params, base_optimizer_cls,
-                 base_optimizer_params=None, heads_groups=(1,), weights_names=None,
+    def __init__(self, params, base_optimizer_cls, weights_optimizer_cls=None,
+                 base_optimizer_params=None, weights_optimizer_params=None,
+                 heads_groups=(1,), weights_names=None,
                  weights_parametrization="abs", rescale_encoder_grad_norm_weights=None,
                  encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
@@ -151,8 +154,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unknown train downstream head mode: {train_downstream_head}")
         defaults = dict(base_optimizer_params or {})
         super().__init__(params, defaults)
-        self.base_optimizer = base_optimizer_cls(self.param_groups, **(base_optimizer_params or {}))
-        self.param_groups = self.base_optimizer.param_groups
+        if weights_optimizer_cls is None:
+            weights_optimizer_cls = base_optimizer_cls
+            weights_optimizer_params = base_optimizer_params
+        self.weights_optimizer = weights_optimizer_cls([self.param_groups[0]], **(weights_optimizer_params or {}))
+        self.base_optimizer = base_optimizer_cls(self.param_groups[1:], **(base_optimizer_params or {}))
+        self.param_groups = self.weights_optimizer.param_groups + self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
 
         if 0 in heads_groups:
@@ -275,6 +282,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if not inner:
             raise ValueError("Please, use 'hpo_step' function.")
         self.base_optimizer.step(closure=closure)
+        self.weights_optimizer.step()
 
     @property
     def _unnormalized_weights(self):
@@ -762,12 +770,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
     def state_dict(self):
         state = self.base_optimizer.state_dict()
+        state["weights_optimizer"] = self.weights_optimizer.state_dict()
         state.update(self.hpo_state_dict())
         return state
 
     def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)  # shallow copy — don't mutate caller's dict
+        weights_opt_state = state_dict.pop("weights_optimizer", None)
         self.base_optimizer.load_state_dict(state_dict)
-        self.param_groups = self.base_optimizer.param_groups
+        if weights_opt_state is not None:
+            self.weights_optimizer.load_state_dict(weights_opt_state)
+        self.param_groups = self.weights_optimizer.param_groups + self.base_optimizer.param_groups
         p = self.logits
         self._running_stats.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                     for k, v in state_dict.get("running_stats", {}).items()})
