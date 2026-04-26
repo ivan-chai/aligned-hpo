@@ -42,7 +42,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
-        algorithm: Either "sgd", "warmup-sgd", "mse", or "none" to disable HPO.
+        algorithm: Either "sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", or "none" to disable HPO.
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
         warmup: Average the specified number of initial observation instead of EMA.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
@@ -141,7 +141,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, the second group being projection heads weights, and the third group being encoder weights.")
         if (len(params[0]["params"]) != 1) or (params[0]["params"][0].ndim != 1):
             raise ValueError("Weights must be flat.")
-        if algorithm not in {"sgd", "warmup-sgd", "mse", "none"}:
+        if algorithm not in {"sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", "none"}:
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
@@ -379,17 +379,29 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     @torch.no_grad()
     def _compute_weights_and_gradients(self, all_grads_covs, products):
         algorithm = self.algorithm
-        if algorithm == "warmup-sgd":
+        if "warmup" in algorithm:
             warmup = self._buffers["n_updates"] < self.warmup
-            algorithm = "mse" if warmup else "sgd"
+            algorithm = "mse" if warmup else algorithm.replace("warmup-", "")
 
-        if algorithm == "sgd":
+        if algorithm in {"sgd", "scaled-sgd"}:
             with torch.enable_grad():
                 weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
             # Normalize products before backward to avoid tiny gradient magnitudes
             # propagating through the normalization graph when gradients are small.
             self.logits.grad = None
-            weights.backward(-products)
+            out_gradients = -products
+            if algorithm == "sgd":
+                moving_norms = []
+                for name in self.weights_names:
+                    normalizer = self._normalizers[name]
+                    if normalizer.is_first:
+                        break
+                    moving_norms.append(normalizer.moving_norm)
+                else:
+                    out_gradients = out_gradients * (torch.stack(moving_norms) / (self._running_stats.get("encoder_transmission", None) or 1))
+            else:
+                assert algorithm == "scaled-sgd"
+            weights.backward(out_gradients)
             if self.regularization != 0:
                 with torch.enable_grad():
                     regularization = (torch.linalg.norm(self.logits) - 1).square()
@@ -579,7 +591,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     for p in group["params"]:
                         p.grad = None
 
-        if self.algorithm in {"sgd", "warmup-sgd"}:
+        if "sgd" in self.algorithm:
             # Use optimizer — also applies head grads when train_downstream_head is "val" or "train-val".
             self.step(inner_closure, inner=True)
         else:
@@ -626,7 +638,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if weights is None:
                 raise RuntimeError("Validation batch must be consumed first, when align is val")
 
-            if (self.algorithm not in {"sgd", "warmup-sgd"}) and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(weights) < self.eps):
+            if ("sgd" not in self.algorithm) and (self.skip_step_zero_weights_limit is not None) and (torch.linalg.norm(weights) < self.eps):
                 skip_step = self._buffers["n_skipped_steps"] < self.skip_step_zero_weights_limit
                 self._buffers["n_skipped_steps"] += 1
                 if not skip_step:
