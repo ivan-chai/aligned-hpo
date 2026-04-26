@@ -292,6 +292,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             weights = self.logits
         else:
             raise RuntimeError(f"Unknown parametrization: {self.weights_parametrization}")
+
+        # Reparametrize.
+        if ("sgd" in self.algorithm) and ("scaled" not in self.algorithm):
+            moving_norms = []
+            for name in self.weights_names:
+                normalizer = self._normalizers[name]
+                if normalizer.is_first:
+                    break
+                moving_norms.append(normalizer.moving_norm)
+            else:
+                weights = weights * torch.stack(moving_norms) / (self._running_stats.get("encoder_transmission", None) or 1)
         return weights
 
     def _normalize_weights(self, weights, pretrain_covariances):
@@ -398,17 +409,6 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # propagating through the normalization graph when gradients are small.
             self.logits.grad = None
             weights.backward(-products)
-            if algorithm == "sgd":
-                moving_norms = []
-                for name in self.weights_names:
-                    normalizer = self._normalizers[name]
-                    if normalizer.is_first:
-                        break
-                    moving_norms.append(normalizer.moving_norm)
-                else:
-                    self.logits.grad *= (torch.stack(moving_norms) / (self._running_stats.get("encoder_transmission", None) or 1)).square()
-            else:
-                assert algorithm == "scaled-sgd"
             if self.regularization != 0:
                 with torch.enable_grad():
                     regularization = (torch.linalg.norm(self.logits) - 1).square()
@@ -511,15 +511,29 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._correlations_tracker.update(products.detach().clone())
         self._weights_tracker.update(weights.detach().clone())
 
-        moving_norms = []
-        for name in self.weights_names:
-            normalizer = self._normalizers[name]
-            if normalizer.is_first:
-                break
-            moving_norms.append(normalizer.moving_norm)
+        if ("sgd" in self.algorithm) and ("scaled" not in self.algorithm):
+            effective_weights = self.logits
         else:
-            moving_norms = torch.stack(moving_norms).clamp(min=self.eps)
-            effective_weights = weights / moving_norms * (self._running_stats.get("encoder_transmission", None) or 1)
+            effective_weights = None
+            moving_norms = []
+            for name in self.weights_names:
+                normalizer = self._normalizers[name]
+                if normalizer.is_first:
+                    break
+                moving_norms.append(normalizer.moving_norm)
+            else:
+                moving_norms = torch.stack(moving_norms).clamp(min=self.eps)
+                effective_weights = weights / moving_norms
+        if effective_weights is not None:
+            if self.rescale_encoder_grad_norm_weights is not None:
+                if self.rescale_encoder_grad_norm_weights.device != weights.device:
+                    self.rescale_encoder_grad_norm_weights = self.rescale_encoder_grad_norm_weights.to(weights.device)
+                moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
+                basis = self.rescale_encoder_grad_norm_weights * moving_norms
+                effective_weights_scaled = effective_weights * moving_norms
+                weights_grads_scale = (effective_weights_scaled[None] @ grads["all_grads_covs"].detach() @ effective_weights_scaled).sqrt()
+                basis_grads_scale = (basis[None] @ grads["all_grads_covs"].detach() @ basis).sqrt()
+                effective_weights *= basis_grads_scale / weights_grads_scale
             self._effective_weights_tracker.update(effective_weights.detach().clone())
 
         self._buffers["n_updates"] += 1
