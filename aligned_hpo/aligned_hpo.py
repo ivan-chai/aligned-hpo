@@ -397,7 +397,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             # Normalize products before backward to avoid tiny gradient magnitudes
             # propagating through the normalization graph when gradients are small.
             self.logits.grad = None
-            out_gradients = -products
+            weights.backward(-products)
             if algorithm == "sgd":
                 moving_norms = []
                 for name in self.weights_names:
@@ -406,10 +406,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                         break
                     moving_norms.append(normalizer.moving_norm)
                 else:
-                    out_gradients = out_gradients * (torch.stack(moving_norms) / (self._running_stats.get("encoder_transmission", None) or 1))
+                    self.logits.grad *= (torch.stack(moving_norms) / (self._running_stats.get("encoder_transmission", None) or 1)).square()
             else:
                 assert algorithm == "scaled-sgd"
-            weights.backward(out_gradients)
             if self.regularization != 0:
                 with torch.enable_grad():
                     regularization = (torch.linalg.norm(self.logits) - 1).square()
