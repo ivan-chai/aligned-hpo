@@ -22,6 +22,7 @@ setuptools.setup(
     python_requires=">=3.9",
     install_requires=[
         "cvxopt>=1.3.0",
+        "datasketches>=5.0.0",
         "numpy>=1.23",
         "qpsolvers>=4.0.0",
         "scipy>=1.11",

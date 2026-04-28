@@ -284,8 +284,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.base_optimizer.step(closure=closure)
         self.weights_optimizer.step()
 
-    @property
-    def _unnormalized_weights(self):
+    def _unnormalized_weights(self, reparametrize=True):
         if self.weights_parametrization == "abs":
             weights = torch.where(self.logits >= 0, self.logits, -self.logits)  # Abs with positive grad at zero.
         elif self.weights_parametrization == "linear":
@@ -294,7 +293,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise RuntimeError(f"Unknown parametrization: {self.weights_parametrization}")
 
         # Reparametrize.
-        if ("sgd" in self.algorithm) and ("scaled" not in self.algorithm):
+        if reparametrize and ("sgd" in self.algorithm) and ("scaled" not in self.algorithm):
             moving_norms = []
             for name in self.weights_names:
                 normalizer = self._normalizers[name]
@@ -404,14 +403,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if algorithm in {"sgd", "scaled-sgd"}:
             with torch.enable_grad():
-                weights = self._normalize_weights(self._unnormalized_weights, pretrain_covariances=all_grads_covs)
+                weights = self._normalize_weights(self._unnormalized_weights(), pretrain_covariances=all_grads_covs)
             # Normalize products before backward to avoid tiny gradient magnitudes
             # propagating through the normalization graph when gradients are small.
             self.logits.grad = None
             weights.backward(-products)
             if self.regularization != 0:
                 with torch.enable_grad():
-                    regularization = (torch.linalg.norm(self._unnormalized_weights) - 1).square()
+                    regularization = (torch.linalg.norm(self._unnormalized_weights()) - 1).square()
                     (regularization * self.regularization).backward()
             return weights, self.logits.grad.clone()
         elif algorithm == "mse":
@@ -429,7 +428,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             return weights, None
         else:
             assert algorithm == "none"
-            weights = self._unnormalized_weights
+            weights = self._unnormalized_weights()
             return weights, None
 
     @torch.no_grad()
@@ -512,7 +511,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._weights_tracker.update(weights.detach().clone())
 
         if ("sgd" in self.algorithm) and ("scaled" not in self.algorithm):
-            effective_weights = self.logits
+            effective_weights = self._unnormalized_weights(reparametrize=False)
         else:
             effective_weights = None
             moving_norms = []
