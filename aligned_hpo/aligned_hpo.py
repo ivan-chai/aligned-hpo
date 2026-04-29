@@ -44,7 +44,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
-        algorithm: Either "sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", or "none" to disable HPO.
+        algorithm: Either "sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", "none-nonorm", or "none" to disable HPO.
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
         warmup: Average the specified number of initial observation instead of EMA.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
@@ -144,7 +144,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, the second group being projection heads weights, and the third group being encoder weights.")
         if (len(params[0]["params"]) != 1) or (params[0]["params"][0].ndim != 1):
             raise ValueError("Weights must be flat.")
-        if algorithm not in {"sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", "none"}:
+        if algorithm not in {"sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", "none-nonorm", "none"}:
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
@@ -211,7 +211,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         self._normalizers = {name: GradientNormalizer(clip=self.eps ** 2,
                                                       momentum=self.stats_momentum,
-                                                      check_shape=not encoder_decoder)
+                                                      check_shape=not encoder_decoder,
+                                                      disable="nonorm" in algorithm)
                              for name in self.weights_names}
         self._normalizers_trackers = {name: StatsTracker(f"grad_norm_{name}", self.stats_momentum, track_median=True)
                                       for name in self.weights_names}
@@ -401,7 +402,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             warmup = self._buffers["n_updates"] < self.warmup
             algorithm = "mse" if warmup else algorithm.replace("warmup-", "")
 
-        if algorithm in {"sgd", "scaled-sgd"}:
+        if "sgd" in algorithm:
             with torch.enable_grad():
                 weights = self._normalize_weights(self._unnormalized_weights(), pretrain_covariances=all_grads_covs)
             # Normalize products before backward to avoid tiny gradient magnitudes
@@ -427,7 +428,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 weights = solve_qcqp(all_grads_covs, products, positive=positive)
             return weights, None
         else:
-            assert algorithm == "none"
+            assert "none" in algorithm
             weights = self._unnormalized_weights()
             return weights, None
 
@@ -504,7 +505,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights = self._update_running_stats(weights, stage="weights")
 
         self.logits.grad = logits_grads
-        if (logits_grads is None) and (self.algorithm != "none"):
+        if (logits_grads is None) and ("none" not in self.algorithm):
             self.logits.copy_(weights)
 
         self._correlations_tracker.update(products.detach().clone())
@@ -616,7 +617,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self.step(inner_closure, inner=True)
         else:
             # Closed-form computation.
-            assert self.algorithm in {"mse", "none"}
+            assert "sgd" not in self.algorithm
             inner_closure()
             if self.train_downstream_head in {"val", "train-val"}:
                 self.step(inner=True)

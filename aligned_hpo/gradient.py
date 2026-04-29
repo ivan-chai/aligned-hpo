@@ -9,13 +9,14 @@ class GradientNormalizer(torch.nn.Module):
         Normalized gradient norm.
     """
 
-    def __init__(self, clip=1e-2, momentum=0.9, check_shape=True):
+    def __init__(self, clip=1e-2, momentum=0.9, check_shape=True, disable=False):
         super().__init__()
         self._check_shape = check_shape
         self._momentum = momentum
         self._clip = clip
         self._shape = None
         self._is_first = True
+        self._disable = disable
         self.register_buffer("moving_norm", torch.zeros([]))
         self.register_buffer("last_norm", torch.zeros([]))
 
@@ -53,7 +54,9 @@ class GradientNormalizer(torch.nn.Module):
             momentum = 0 if self._is_first else self._momentum
             self.moving_norm.fill_(self.moving_norm * momentum + (1 - momentum) * norm)
             mean = self.moving_norm.clip(min=self._clip).item()
-            if isinstance(parameters, torch.Tensor):
+            if self._disable:
+                pass
+            elif isinstance(parameters, torch.Tensor):
                 parameters /= mean
             else:
                 for p in parameters:
