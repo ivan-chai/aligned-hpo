@@ -241,6 +241,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum, track_median=False)
 
     @property
+    def need_losses(self):
+        return False
+
+    @property
     def use_validation(self):
         return self.align != "train"
 
