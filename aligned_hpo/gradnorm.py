@@ -254,6 +254,22 @@ class GradNormOptimizer(torch.optim.Optimizer):
             # Per-task gradient norms at encoder (or z proxy).
             g_norms = torch.stack([v.norm() for v in all_encoder_grads]).detach()
 
+            # DDP: average scalar norms and losses across ranks so the GradNorm
+            # weight update (w.grad) is identical everywhere. Full gradient vectors
+            # are not all-reduced — same approximation as AlignedHPO.
+            is_distributed = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            )
+            if is_distributed:
+                world_size = torch.distributed.get_world_size()
+                flat = torch.cat([g_norms, losses_tensor])
+                torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+                flat /= world_size
+                g_norms = flat[:self.n_weights]
+                losses_tensor = flat[self.n_weights:]
+
             w = self.weights
             w_abs = w.abs().detach()
 
