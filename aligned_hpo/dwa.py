@@ -92,6 +92,10 @@ class DWAOptimizer(torch.optim.Optimizer):
         return True
 
     @property
+    def use_validation(self):
+        return False
+
+    @property
     def weights(self):
         return self.param_groups[0]["params"][0]
 
@@ -139,7 +143,7 @@ class DWAOptimizer(torch.optim.Optimizer):
         r = L_prev / L_prev2.clamp(min=1e-8)
         return torch.softmax(r / self.temperature, dim=0).mul_(n)
 
-    def hpo_step(self, closure, closure_encoder=None):
+    def hpo_step(self, closure, closure_encoder=None, embed_fn=None, after_backward_hook=None):
         """Make one DWA optimization step.
 
         Args:
@@ -149,6 +153,8 @@ class DWAOptimizer(torch.optim.Optimizer):
                 (z, losses) where z.grad holds the gradient w.r.t. the encoder output.
             closure_encoder: callable(z_grad) -> None. Required in encoder_decoder mode.
                 Must zero gradients and call embeddings.backward(z_grad.reshape_as(embeddings)).
+            embed_fn: Unused.
+            after_backward_hook: A function to call after gradients are estimated (gradient clipping etc.).
 
         Returns:
             Task weights used for this step, shape (n_tasks,).
@@ -220,6 +226,9 @@ class DWAOptimizer(torch.optim.Optimizer):
             self._weights_tracker.update(computed_weights.clone())
             self._losses_tracker.update(losses_detached.clone())
             self._n_updates += 1
+
+            if after_backward_hook is not None:
+                after_backward_hook()
 
         self.step(inner_closure, inner=True)
         return output_weights

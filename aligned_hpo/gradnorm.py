@@ -144,6 +144,10 @@ class GradNormOptimizer(torch.optim.Optimizer):
         return True
 
     @property
+    def use_validation(self):
+        return False
+
+    @property
     def weights(self):
         return self.param_groups[0]["params"][0]
 
@@ -182,7 +186,7 @@ class GradNormOptimizer(torch.optim.Optimizer):
             return self.weights.new_zeros(0)
         return torch.cat(grads)
 
-    def hpo_step(self, closure, closure_encoder=None):
+    def hpo_step(self, closure, closure_encoder=None, embed_fn=None, after_backward_hook=None):
         """Make one GradNorm optimization step.
 
         Args:
@@ -192,6 +196,8 @@ class GradNormOptimizer(torch.optim.Optimizer):
                 must also zero z.grad and return (z, losses) where z.grad is set.
             closure_encoder: callable(z_grad) -> None. Required in encoder_decoder mode.
                 Must zero gradients and call embeddings.backward(z_grad).
+            embed_fn: Unused.
+            after_backward_hook: A function to call after gradients are estimated (gradient clipping etc.).
 
         Returns:
             Task weights (absolute values) used for this step, shape (n_tasks,).
@@ -317,6 +323,9 @@ class GradNormOptimizer(torch.optim.Optimizer):
             self._weights_tracker.update(w_abs.clone())
             self._g_norms_tracker.update(g_norms.clone())
             self._n_updates += 1
+
+            if after_backward_hook is not None:
+                after_backward_hook()
 
         self.step(inner_closure, inner=True)
 
