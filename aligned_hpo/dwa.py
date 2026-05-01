@@ -257,13 +257,18 @@ class DWAOptimizer(torch.optim.Optimizer):
         self.step(inner_closure, inner=True)
         return output_weights
 
-    def state_dict(self):
-        state = self.base_optimizer.state_dict()
+    def hpo_state_dict(self, add_names=False):
+        state = {}
         state["weights_data"] = self.weights.data.clone()
         state["loss_history"] = list(self._loss_history)
         state["n_updates"] = self._n_updates
         state["weights_tracker"] = self._weights_tracker.state_dict()
         state["losses_tracker"] = self._losses_tracker.state_dict()
+        return state
+
+    def state_dict(self):
+        state = self.base_optimizer.state_dict()
+        state.update(self.hpo_state_dict())
         return state
 
     def load_state_dict(self, state_dict):

@@ -352,14 +352,19 @@ class GradNormOptimizer(torch.optim.Optimizer):
 
         return output_weights
 
-    def state_dict(self):
-        state = self.base_optimizer.state_dict()
-        state["weights_optimizer"] = self.weights_optimizer.state_dict()
+    def hpo_state_dict(self, add_names=False):
+        state = {}
         state["weights_data"] = self.weights.data.clone()
         state["initial_losses"] = self._initial_losses
         state["n_updates"] = self._n_updates
         state["weights_tracker"] = self._weights_tracker.state_dict()
         state["g_norms_tracker"] = self._g_norms_tracker.state_dict()
+        return state
+
+    def state_dict(self):
+        state = self.base_optimizer.state_dict()
+        state["weights_optimizer"] = self.weights_optimizer.state_dict()
+        state.update(self.hpo_state_dict())
         return state
 
     def load_state_dict(self, state_dict):
