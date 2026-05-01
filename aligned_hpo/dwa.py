@@ -1,5 +1,6 @@
 import torch
 
+from .aligned_hpo import HPO_STAGE_DOWNSTREAM
 from .stats import StatsTracker
 
 
@@ -29,9 +30,11 @@ class DWAOptimizer(torch.optim.Optimizer):
             backward. A closure_encoder must be passed to hpo_step. See hpo_step.
 
     The closure passed to hpo_step must have the signature:
-        closure(weights, retain_graph=False) -> Tensor(n_tasks,)
-    It must call zero_grad(), compute (weights * individual_losses).sum().backward(...),
+        closure(down_weight, weights, retain_graph=False, stage=None) -> Tensor(n_tasks,)
+    It must call zero_grad(), compute
+        (down_weight * downstream_loss + (weights * individual_losses).sum()).backward(...),
     and return the individual task losses. The optimizer detaches them internally.
+    down_weight is 0 or 1; stage is HPO_STAGE_DOWNSTREAM or None.
 
     In encoder_decoder mode the closure returns (z, Tensor(n_tasks,)) and a separate
     closure_encoder(z_grad) must be provided to hpo_step.
@@ -147,10 +150,12 @@ class DWAOptimizer(torch.optim.Optimizer):
         """Make one DWA optimization step.
 
         Args:
-            closure: callable(weights, retain_graph=False) -> losses or (z, losses).
-                Must zero gradients, call (weights * individual_losses).sum().backward(...),
+            closure: callable(down_weight, weights, retain_graph=False, stage=None) -> losses or (z, losses).
+                Must zero gradients, compute
+                (down_weight * downstream_loss + (weights * individual_losses).sum()).backward(...),
                 and return individual task losses. In encoder_decoder mode must return
                 (z, losses) where z.grad holds the gradient w.r.t. the encoder output.
+                down_weight is 0 or 1; stage is HPO_STAGE_DOWNSTREAM or None.
             closure_encoder: callable(z_grad) -> None. Required in encoder_decoder mode.
                 Must zero gradients and call embeddings.backward(z_grad.reshape_as(embeddings)).
             embed_fn: Unused.
@@ -173,7 +178,13 @@ class DWAOptimizer(torch.optim.Optimizer):
             device = self.weights.device
             computed_weights = self._compute_weights().to(device)
 
-            result = closure(computed_weights, retain_graph=False)
+            # Phase 1: downstream backward — collect head grads for downstream loss.
+            weights_zeros = self.weights.new_zeros(self.n_weights)
+            closure(1, weights_zeros, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
+            heads_down_grads = self._gather_grads("heads").clone()
+
+            # Phase 2: pretrain backward with DWA-computed weights.
+            result = closure(0, computed_weights, retain_graph=False, stage=None)
 
             if self.encoder_decoder:
                 z, losses = result
@@ -214,8 +225,21 @@ class DWAOptimizer(torch.optim.Optimizer):
             output_weights.copy_(computed_weights)
 
             if self.encoder_decoder:
-                heads_grad = self._gather_grads("heads")
+                # Save pretrain head grads before closure_encoder calls zero_grad().
+                heads_pretrain_grads = self._gather_grads("heads").clone()
                 closure_encoder(z.grad)
+                # Restore combined head grads (closure_encoder zeroes all grads).
+                heads_grad = heads_pretrain_grads + heads_down_grads
+                offset = 0
+                for i in self.heads_groups:
+                    for p in self.param_groups[i]["params"]:
+                        numel = p.numel()
+                        p.grad = heads_grad[offset:offset + numel].reshape(p.shape)
+                        offset += numel
+            else:
+                # Combine pretrain head grads with downstream head grads.
+                pretrain_heads_grad = self._gather_grads("heads").clone()
+                heads_grad = pretrain_heads_grad + heads_down_grads
                 offset = 0
                 for i in self.heads_groups:
                     for p in self.param_groups[i]["params"]:

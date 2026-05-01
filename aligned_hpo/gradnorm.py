@@ -1,5 +1,6 @@
 import torch
 
+from .aligned_hpo import HPO_STAGE_DOWNSTREAM
 from .stats import StatsTracker
 
 
@@ -27,10 +28,13 @@ class GradNormOptimizer(torch.optim.Optimizer):
             backward. A closure_encoder must be passed to hpo_step. See hpo_step.
 
     The closure passed to hpo_step must have the signature:
-        closure(weights, retain_graph=False) -> Tensor(n_tasks,)
-    It must call zero_grad(), compute (weights * individual_losses).sum().backward(...),
+        closure(down_weight, weights, retain_graph=False, stage=None) -> Tensor(n_tasks,)
+    It must call zero_grad(), compute
+        (down_weight * downstream_loss + (weights * individual_losses).sum()).backward(...),
     and return the individual task losses. GradNorm detaches them internally. The closure
-    is called once per task with a one-hot weight vector to obtain per-task gradients.
+    is called once with down_weight=1 to obtain downstream head gradients, then once per
+    task with a one-hot weight vector to obtain per-task encoder and head gradients.
+    down_weight is 0 or 1; stage is HPO_STAGE_DOWNSTREAM or integer task index.
 
     In encoder_decoder mode the closure returns (z, Tensor(n_tasks,)) and a separate
     closure_encoder(z_grad) must be provided to hpo_step.
@@ -40,19 +44,21 @@ class GradNormOptimizer(torch.optim.Optimizer):
 
         optimizer = GradNormOptimizer(
             [{"params": [task_weights]},
-             {"params": list(head1.parameters()) + list(head2.parameters())},
+             {"params": list(head1.parameters()) + list(head2.parameters()) + list(head_down.parameters())},
              {"params": encoder.parameters()}],
             torch.optim.Adam, {"lr": 1e-3},
         )
 
         z = encoder(x)
+        l_down = criterion_down(head_down(z), y_down)
         loss1 = criterion1(head1(z), y1)
         loss2 = criterion2(head2(z), y2)
 
-        def closure(weights, retain_graph=False):
+        def closure(down_weight, weights, retain_graph=False, stage=None):
             optimizer.zero_grad()
             losses = torch.stack([loss1, loss2])
-            (weights * losses).sum().backward(retain_graph=retain_graph)
+            loss = down_weight * l_down + (weights * losses).sum()
+            loss.backward(retain_graph=retain_graph)
             return losses
 
         optimizer.hpo_step(closure)
@@ -63,14 +69,16 @@ class GradNormOptimizer(torch.optim.Optimizer):
         embeddings = encoder(x)
         z = embeddings.detach().clone()
         z.requires_grad = True
+        l_down = criterion_down(head_down(z), y_down)
         loss1 = criterion1(head1(z), y1)
         loss2 = criterion2(head2(z), y2)
 
-        def closure(weights, retain_graph=False):
+        def closure(down_weight, weights, retain_graph=False, stage=None):
             optimizer.zero_grad()
             z.grad = None
             losses = torch.stack([loss1, loss2])
-            (weights * losses).sum().backward(retain_graph=retain_graph)
+            loss = down_weight * l_down + (weights * losses).sum()
+            loss.backward(retain_graph=retain_graph)
             return z, losses
 
         def closure_encoder(z_grad):
@@ -190,12 +198,14 @@ class GradNormOptimizer(torch.optim.Optimizer):
         """Make one GradNorm optimization step.
 
         Args:
-            closure: callable(weights, retain_graph=False) -> losses or (z, losses).
-                Must zero gradients, call (weights * individual_losses).sum().backward(...),
-                and return individual task losses (detached). In encoder_decoder mode,
-                must also zero z.grad and return (z, losses) where z.grad is set.
+            closure: callable(down_weight, weights, retain_graph=False, stage=None) -> losses or (z, losses).
+                Must zero gradients, compute
+                (down_weight * downstream_loss + (weights * individual_losses).sum()).backward(...),
+                and return individual task losses. In encoder_decoder mode must also zero z.grad
+                and return (z, losses) where z.grad is set after backward.
+                down_weight is 0 or 1; stage is HPO_STAGE_DOWNSTREAM or integer task index.
             closure_encoder: callable(z_grad) -> None. Required in encoder_decoder mode.
-                Must zero gradients and call embeddings.backward(z_grad).
+                Must zero gradients and call embeddings.backward(z_grad.reshape_as(embeddings)).
             embed_fn: Unused.
             after_backward_hook: A function to call after gradients are estimated (gradient clipping etc.).
 
@@ -215,6 +225,12 @@ class GradNormOptimizer(torch.optim.Optimizer):
         def inner_closure():
             device = self.weights.device
 
+            # Phase 1: downstream backward — collect head grads for downstream loss.
+            weights_zeros = self.weights.new_zeros(self.n_weights)
+            closure(1, weights_zeros, retain_graph=True, stage=HPO_STAGE_DOWNSTREAM)
+            heads_down_grads = self._gather_grads("heads").clone()
+
+            # Phase 2: per-task backwards — collect per-task encoder and head grads.
             all_encoder_grads = []  # z.grad (encoder_decoder) or encoder param grads
             all_heads_grads = []
             losses_tensor = None
@@ -222,7 +238,7 @@ class GradNormOptimizer(torch.optim.Optimizer):
             weights_i = self.weights.new_zeros(self.n_weights)
             for i in range(self.n_weights):
                 weights_i[i] = 1.0
-                result = closure(weights_i, retain_graph=(i < self.n_weights - 1))
+                result = closure(0, weights_i, retain_graph=(i < self.n_weights - 1), stage=i)
                 weights_i[i] = 0.0
 
                 if self.encoder_decoder:
@@ -309,9 +325,9 @@ class GradNormOptimizer(torch.optim.Optimizer):
                         p.grad = encoder_grad[offset:offset + numel].reshape(p.shape)
                         offset += numel
 
-            # Weighted head gradient.
+            # Weighted head gradient + downstream head gradient.
             all_heads_grads_t = torch.stack(all_heads_grads)  # (n_tasks, dim)
-            heads_grad = w_abs @ all_heads_grads_t
+            heads_grad = w_abs @ all_heads_grads_t + heads_down_grads
             offset = 0
             for i in self.heads_groups:
                 for p in self.param_groups[i]["params"]:
