@@ -39,7 +39,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         heads_groups: Indices of parameter groups, related to individual loss heads.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
-        rescale_encoder_grad_norm_weights: If provided, scale gradients to match the norm of the training with the specified weights.
+        rescale_grad_norm_weights: If provided, scale gradients to match the norm of the training with the specified weights.
         encoder_downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
@@ -133,7 +133,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, weights_optimizer_cls=None,
                  base_optimizer_params=None, weights_optimizer_params=None,
                  heads_groups=(1,), weights_names=None,
-                 weights_parametrization="abs", rescale_encoder_grad_norm_weights=None,
+                 weights_parametrization="abs", rescale_grad_norm_weights=None,
                  encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
                  align="train", train_downstream_head="train",
@@ -177,10 +177,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
 
-        if rescale_encoder_grad_norm_weights is not None:
-            rescale_encoder_grad_norm_weights = torch.tensor(rescale_encoder_grad_norm_weights, device=self.logits.device, dtype=self.logits.dtype)
-            assert len(rescale_encoder_grad_norm_weights) == len(self.logits)
-        self.rescale_encoder_grad_norm_weights = rescale_encoder_grad_norm_weights
+        if rescale_grad_norm_weights is not None:
+            rescale_grad_norm_weights = torch.tensor(rescale_grad_norm_weights, device=self.logits.device, dtype=self.logits.dtype)
+            assert len(rescale_grad_norm_weights) == len(self.logits)
+        self.rescale_grad_norm_weights = rescale_grad_norm_weights
         self.encoder_downstream_weight = encoder_downstream_weight
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
@@ -529,11 +529,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 moving_norms = torch.stack(moving_norms).clamp(min=self.eps)
                 effective_weights = weights / moving_norms
         if effective_weights is not None:
-            if self.rescale_encoder_grad_norm_weights is not None:
-                if self.rescale_encoder_grad_norm_weights.device != weights.device:
-                    self.rescale_encoder_grad_norm_weights = self.rescale_encoder_grad_norm_weights.to(weights.device)
+            if self.rescale_grad_norm_weights is not None:
+                if self.rescale_grad_norm_weights.device != weights.device:
+                    self.rescale_grad_norm_weights = self.rescale_grad_norm_weights.to(weights.device)
                 moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
-                basis = self.rescale_encoder_grad_norm_weights * moving_norms
+                basis = self.rescale_grad_norm_weights * moving_norms
                 effective_weights_scaled = effective_weights * moving_norms
                 weights_grads_scale = (effective_weights_scaled[None] @ grads["all_grads_covs"].detach() @ effective_weights_scaled).sqrt()
                 basis_grads_scale = (basis[None] @ grads["all_grads_covs"].detach() @ basis).sqrt()
@@ -678,17 +678,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             output_weights.copy_(weights)
 
             # Set gradients for the encoder model weights.
-            if self.rescale_encoder_grad_norm_weights is not None:
-                if self.rescale_encoder_grad_norm_weights.device != weights.device:
-                    self.rescale_encoder_grad_norm_weights = self.rescale_encoder_grad_norm_weights.to(weights.device)
+            if self.rescale_grad_norm_weights is not None:
+                if self.rescale_grad_norm_weights.device != weights.device:
+                    self.rescale_grad_norm_weights = self.rescale_grad_norm_weights.to(weights.device)
                 moving_norms = torch.stack([self._normalizers[name].moving_norm for name in self.weights_names])
-                basis = self.rescale_encoder_grad_norm_weights * moving_norms
+                basis = self.rescale_grad_norm_weights * moving_norms
                 encoder_grads_scale = (basis[None] @ grads["all_grads_covs"].detach() @ basis).sqrt()
             else:
                 encoder_grads_scale = 1
             if self.encoder_decoder:
                 # Backprop with z grads. Keep logits grad intact.
-                if self.rescale_encoder_grad_norm_weights is None:
+                if self.rescale_grad_norm_weights is None:
                     encoder_grads_scale *= (self._running_stats["encoder_transmission"] or 1)
                 scale = encoder_grads_scale * self.scale_gradients
                 z_grad = (scale * weights) @ torch.stack(grads["all_z_grads"])
@@ -726,7 +726,12 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 del encoder_grad
 
             # Set grads for individual heads model.
-            heads_grad = torch.stack(grads["all_heads_grads"]).sum(0)
+            if self.rescale_grad_norm_weights is not None:
+                if self.rescale_grad_norm_weights.device != weights.device:
+                    self.rescale_grad_norm_weights = self.rescale_grad_norm_weights.to(weights.device)
+                heads_grad = self.rescale_grad_norm_weights @ torch.stack(grads["all_heads_grads"])
+            else:
+                heads_grad = torch.stack(grads["all_heads_grads"]).sum(0)
             if self.train_downstream_head in {"train", "train-val"}:
                 heads_grad.add_(grads["heads_down_grads"])
             if self.scale_gradients != 1:
