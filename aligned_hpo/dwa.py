@@ -5,7 +5,7 @@ from .stats import StatsTracker
 
 
 class DWAOptimizer(torch.optim.Optimizer):
-    """Dynamic Weight Averaging (Liu et al., 2019).
+    """Dynamic Weight Averaging from "End-to-End Multi-Task Learning with Attention" (Liu et al., 2019).
 
     Computes task weights closed-form from the ratio of consecutive per-task losses:
 
