@@ -39,6 +39,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         heads_groups: Indices of parameter groups, related to individual loss heads.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
+        weights_normalization: Either "gradnorm" (default), "sum", or "none".
         rescale_grad_norm_weights: If provided, scale gradients to match the norm of the training with the specified weights.
         encoder_downstream_weight: The weight of the downstream gradient in encoder optimization. Default is 0 (disable).
         downstream_merge: Fill zero values in encoder gradient with downsrtream gradient.
@@ -133,7 +134,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer_cls, weights_optimizer_cls=None,
                  base_optimizer_params=None, weights_optimizer_params=None,
                  heads_groups=(1,), weights_names=None,
-                 weights_parametrization="abs", rescale_grad_norm_weights=None,
+                 weights_parametrization="abs", weights_normalization="gradnorm", rescale_grad_norm_weights=None,
                  encoder_downstream_weight=0, downstream_merge=False,
                  encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
                  align="train", train_downstream_head="train",
@@ -148,6 +149,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unexpected algorithm: {algorithm}")
         if weights_parametrization not in ["linear", "abs"]:
             raise ValueError(f"Unknown weights parametrization method: {weights_parametrization}")
+        if weights_normalization not in ["gradnorm", "sum", "none"]:
+            raise ValueError(f"Unknown weights normalization method: {weights_normalization}")
         if align not in ["train", "val", "train-val"]:
             raise ValueError(f"Unknown align mode: {align}")
         if train_downstream_head not in ["train", "val", "train-val"]:
@@ -176,6 +179,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if self.n_weights == 0:
             raise ValueError("Empty hyperparameters list.")
         self.weights_parametrization = weights_parametrization
+        self.weights_normalization = weights_normalization
 
         if rescale_grad_norm_weights is not None:
             rescale_grad_norm_weights = torch.tensor(rescale_grad_norm_weights, device=self.logits.device, dtype=self.logits.dtype)
@@ -312,9 +316,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def _normalize_weights(self, weights, pretrain_covariances):
         if torch.linalg.norm(weights) < self.eps ** 2:
             return weights
-        pretrain_covariances = pretrain_covariances.detach()
-        weights_grad_norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
-        weights = weights / weights_grad_norm.clamp(min=self.eps ** 2)
+        if self.weights_normalization == "gradnorm":
+            pretrain_covariances = pretrain_covariances.detach()
+            weights_grad_norm = (weights[None] @ pretrain_covariances @ weights).sqrt()
+            weights = weights / weights_grad_norm.clamp(min=self.eps ** 2)
+        elif self.weights_normalization == "sum":
+            weights = weights / weights.sum()
+        elif self.weights_normalization != "none":
+            raise ValueError(f"Unknown weights normalization: {self.weights_normalization}")
         return weights
 
     def _update_running_stats(self, value, stage=None):
@@ -419,6 +428,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     (regularization * self.regularization).backward()
             return weights, self.logits.grad.clone()
         elif algorithm == "mse":
+            if self.weights_normalization != "gradnorm":
+                raise NotImplementedError(f"MSE algorithm with {self.weights_normalization} normalization")
             if self.weights_parametrization == "abs":
                 positive = True
             else:
