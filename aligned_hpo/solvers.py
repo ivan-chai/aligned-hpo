@@ -96,8 +96,8 @@ def solve_qcqp(C, b, positive=False, tol=1e-12, rcond=1e-8, max_iter=100, eps=1e
         S = {j}
 
     x = np.zeros(n)
-    max_weights = 1 / np.sqrt(np.diag(C_s)).clip(min=eps)
-    best_x = np.argmax(b_s * max_weights)
+    max_weights = 1 / np.sqrt(np.diag(C)).clip(min=eps)
+    best_x = np.argmax(b * max_weights)
     x[best_x] = max_weights[best_x]
     for _ in range(max_iter):
         S_list = sorted(S)

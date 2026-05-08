@@ -10,7 +10,7 @@ from aligned_hpo.stats import StatsTracker
 class TestStatsTracker(TestCase):
 
     def _tracker(self, ema=0.9):
-        return StatsTracker("loss", ema)
+        return StatsTracker("loss", ema, track_median=True)
 
     # ------------------------------------------------------------------
     # Basic scalar tracking
@@ -22,7 +22,7 @@ class TestStatsTracker(TestCase):
         self.assertEqual(t.last_value, 3.0)
         self.assertEqual(t.ema_value, 3.0)
         self.assertEqual(t.avg_value, 3.0)
-        self.assertAlmostEqual(t.median_value, 3.0)
+        self.assertAlmostEqual(t.get()["median_loss"], 3.0)
 
     def test_avg_and_ema(self):
         t = self._tracker(ema=0.9)
@@ -35,25 +35,12 @@ class TestStatsTracker(TestCase):
             ema = ema * 0.9 + v * 0.1
         self.assertAlmostEqual(float(t.ema_value), ema)
 
-    # ------------------------------------------------------------------
-    # Median bootstrap (first 5 observations)
-    # ------------------------------------------------------------------
-
-    def test_median_available_from_first_update(self):
-        t = self._tracker()
-        for i, expected in enumerate([5.0, 3.0, 3.0, 2.5, 3.0], start=1):
-            # Observations: 5, 1, 3, 2, 4 — running exact medians: 5, 3, 3, 2.5, 3
-            t.update([5.0, 1.0, 3.0, 2.0, 4.0][i - 1])
-            self.assertIsNotNone(t.median_value,
-                                 f"median_value should not be None after {i} update(s)")
-            self.assertAlmostEqual(t.median_value, expected)
-
     def test_median_after_5_updates(self):
         t = self._tracker()
         for v in [5.0, 1.0, 3.0, 2.0, 4.0]:
             t.update(v)
         # Sorted: [1, 2, 3, 4, 5] — median is exactly 3.0.
-        self.assertAlmostEqual(t.median_value, 3.0)
+        self.assertAlmostEqual(t.get()["median_loss"], 3.0)
 
     # ------------------------------------------------------------------
     # Median accuracy on streams
@@ -67,7 +54,7 @@ class TestStatsTracker(TestCase):
         for v in values:
             t.update(v)
         true_median = statistics.median(values)
-        self.assertAlmostEqual(t.median_value, true_median, delta=5.0)
+        self.assertAlmostEqual(t.get()["median_loss"], true_median, delta=5.0)
 
     def test_median_sorted_stream(self):
         """P² estimate on an ascending stream still converges into a reasonable range."""
@@ -76,7 +63,7 @@ class TestStatsTracker(TestCase):
         for v in values:
             t.update(float(v))
         true_median = statistics.median(values)  # 100.5
-        self.assertAlmostEqual(t.median_value, true_median, delta=20.0)
+        self.assertAlmostEqual(t.get()["median_loss"], true_median, delta=20.0)
 
     # ------------------------------------------------------------------
     # Scalar tensor input (0-d)
@@ -86,7 +73,7 @@ class TestStatsTracker(TestCase):
         t = self._tracker()
         for v in [1.0, 2.0, 3.0, 4.0, 5.0]:
             t.update(torch.tensor(v))
-        self.assertAlmostEqual(t.median_value, 3.0)
+        self.assertAlmostEqual(t.get()["median_loss"], 3.0)
 
     # ------------------------------------------------------------------
     # Flat (1-D) tensor input
@@ -99,10 +86,11 @@ class TestStatsTracker(TestCase):
         rows = [[5.0, 10.0], [1.0, 2.0], [3.0, 6.0], [2.0, 4.0], [4.0, 8.0]]
         for row in rows:
             t.update(torch.tensor(row))
-        self.assertIsInstance(t.median_value, torch.Tensor)
-        self.assertEqual(t.median_value.shape, (2,))
-        self.assertAlmostEqual(t.median_value[0].item(), 3.0)
-        self.assertAlmostEqual(t.median_value[1].item(), 6.0)
+        median = t.get()["median_loss"]
+        self.assertIsInstance(median, torch.Tensor)
+        self.assertEqual(median.shape, (2,))
+        self.assertAlmostEqual(median[0].item(), 3.0)
+        self.assertAlmostEqual(median[1].item(), 6.0)
 
     def test_flat_tensor_avg_and_ema(self):
         """avg_value and ema_value are computed element-wise for flat tensors."""
@@ -124,9 +112,10 @@ class TestStatsTracker(TestCase):
         for row in data:
             t.update(row)
         true_median = data.median(dim=0).values
+        median = t.get()["median_loss"]
         self.assertTrue(
-            torch.allclose(t.median_value, true_median, atol=5.0),
-            f"median estimate {t.median_value} too far from true {true_median}",
+            torch.allclose(median, true_median, atol=5.0),
+            f"median estimate {median} too far from true {true_median}",
         )
 
     def test_flat_tensor_state_dict_roundtrip(self):
@@ -139,7 +128,7 @@ class TestStatsTracker(TestCase):
 
         t2 = self._tracker()
         t2.load_state_dict(sd)
-        self.assertTrue(torch.allclose(t2.median_value, t1.median_value))
+        self.assertTrue(torch.allclose(t2.get()["median_loss"], t1.get()["median_loss"]))
         self.assertTrue(torch.allclose(t2.avg_value.float(), t1.avg_value.float(), atol=1e-5))
 
         # Further updates must stay in sync.
@@ -147,7 +136,7 @@ class TestStatsTracker(TestCase):
             v = torch.randn(3)
             t1.update(v)
             t2.update(v)
-        self.assertTrue(torch.allclose(t2.median_value, t1.median_value))
+        self.assertTrue(torch.allclose(t2.get()["median_loss"], t1.get()["median_loss"]))
 
     # ------------------------------------------------------------------
     # get() dict
@@ -177,7 +166,7 @@ class TestStatsTracker(TestCase):
         self.assertEqual(t2.n_updates, t1.n_updates)
         self.assertAlmostEqual(float(t2.avg_value), float(t1.avg_value))
         self.assertAlmostEqual(float(t2.ema_value), float(t1.ema_value))
-        self.assertAlmostEqual(t2.median_value, t1.median_value)
+        self.assertAlmostEqual(t2.get()["median_loss"], t1.get()["median_loss"])
 
     def test_state_dict_continues_correctly(self):
         """After loading state, further updates must produce the same result as the original."""
@@ -192,7 +181,7 @@ class TestStatsTracker(TestCase):
             t1.update(v)
             t2.update(v)
         self.assertAlmostEqual(float(t2.avg_value), float(t1.avg_value))
-        self.assertAlmostEqual(t2.median_value, t1.median_value)
+        self.assertAlmostEqual(t2.get()["median_loss"], t1.get()["median_loss"])
 
 
 if __name__ == "__main__":

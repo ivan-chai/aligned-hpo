@@ -66,7 +66,7 @@ def _make_closure_encoder_decoder(optimizer, encoder, head1, head2, head_down, x
         losses = torch.stack([l1, l2])
         loss = down_weight * l_down + (weights * losses).sum()
         loss.backward(retain_graph=retain_graph)
-        return z, losses
+        return z
 
     def closure_encoder(z_grad):
         optimizer.zero_grad()
@@ -408,7 +408,7 @@ class TestMGDAEncoderDecoder(TestCase):
         def bad_closure(down_weight, weights, retain_graph=False, stage=None):
             opt.zero_grad()
             z_dummy = torch.randn(8, 8, requires_grad=False)
-            return z_dummy, torch.ones(2)  # z has no grad
+            return z_dummy  # z has no grad
 
         with self.assertRaises(TypeError):
             opt.hpo_step(bad_closure, lambda g: None)
