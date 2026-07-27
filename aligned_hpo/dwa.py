@@ -17,11 +17,13 @@ class DWAOptimizer(torch.optim.Optimizer):
     Args:
         params: Parameter groups in the same structure as GradNormOptimizer:
             Group 0: Task weights — a single 1D tensor (used for storage only).
-            Group 1+: Task-specific head parameters (indices given by heads_groups).
+            Group 1: Task-specific head parameters (indices given by heads_groups).
             Group 2+: Shared encoder parameters (all remaining groups).
         base_optimizer_cls: Optimizer class for model parameters.
         base_optimizer_params: Keyword arguments for the base optimizer.
         heads_groups: Indices of task-head parameter groups. Default: (1,).
+        shared_groups: Indices of parameter groups, related to shared loss heads parameters.
+            In this method, shared groups are merged into heads groups.
         weights_names: Optional names for task weights (for logging).
         temperature: Softmax temperature T. Paper default: 2.0.
         ema: EMA coefficient for statistics tracking. Default: 0.9.
@@ -41,7 +43,7 @@ class DWAOptimizer(torch.optim.Optimizer):
     """
 
     def __init__(self, params, base_optimizer_cls, base_optimizer_params=None,
-                 heads_groups=(1,), weights_names=None,
+                 heads_groups=(1,), shared_groups=(), weights_names=None,
                  temperature=2.0, ema=0.9, encoder_decoder=False):
         params = list(params)
         if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
@@ -61,6 +63,7 @@ class DWAOptimizer(torch.optim.Optimizer):
         self.param_groups = [self.param_groups[0]] + self.base_optimizer.param_groups
         self.defaults.update(self.base_optimizer.defaults)
 
+        heads_groups = set(heads_groups) | set(shared_groups)
         if 0 in heads_groups:
             raise ValueError("Group 0 is reserved for task weights.")
         self.heads_groups = list(sorted(set(heads_groups)))
