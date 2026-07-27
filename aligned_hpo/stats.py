@@ -29,6 +29,10 @@ class StatsTracker:
             self._kll.update(float(x))
 
     def update(self, value):
+        if isinstance(value, torch.Tensor) and (self.n_updates > 1) and (value.device != self.last_value.device):
+            device = value.device
+            self.ema_value = self.ema_value.to(device)
+            self.avg_value = self.avg_value.to(device)
         self.n_updates += 1
         self.last_value = value.detach().clone() if isinstance(value, torch.Tensor) else value
         if self.n_updates == 1:

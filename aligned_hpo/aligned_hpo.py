@@ -1,16 +1,12 @@
 import itertools
-import math
-import numpy as np
-import re
-import scipy.optimize
 import torch
 import warnings
 from contextlib import contextmanager
-from copy import deepcopy
 from numbers import Number
 
+from .amtl import procrustes
 from .gradient import GradientNormalizer
-from .solvers import solve_qp, solve_qcqp
+from .solvers import solve_qcqp
 from .stats import StatsTracker
 
 
@@ -37,6 +33,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         weights_optimizer_cls: The optimizer to use for weights. By default equal to base_optimizer_cls.
         weights_optimizer_params: Parameters of the weights optimizer.
         heads_groups: Indices of parameter groups, related to individual loss heads.
+        shared_groups: Indices of parameter groups, related to shared loss heads parameters.
         weights_names: An optional list of names for hyperparameters (for logging).
         weights_parametrization: Either "linear" or "abs".
         weights_normalization: Either "gradnorm" (default), "sum", or "none".
@@ -46,6 +43,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         encoder_decoder: Whether to use encoder-decoder decomposition and upper bound optimization for fast hyperparameter tuning.
             This flag affects an intereface of the provided closure. See notes below.
         algorithm: Either "sgd", "warmup-sgd", "scaled-sgd", "warmup-scaled-sgd", "mse", "none-nonorm", or "none" to disable HPO.
+        shared_algorithm: Shared head gradients aggregation. Use "none" to use the same strategy as for individual heads.
+            Either "none", "weighted" or "aligned-mtl".
         ema: Use momentum for smoothing statistics. Can be a dictionary with "covs", "weights", and "stats" keys. See notes below.
         warmup: Average the specified number of initial observation instead of EMA.
         align: Either `train` to tune weights on the train set only, `val` to tune weights on validation, or `train-val` to align training gradients with validation downstream grad.
@@ -133,10 +132,11 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     """
     def __init__(self, params, base_optimizer_cls, weights_optimizer_cls=None,
                  base_optimizer_params=None, weights_optimizer_params=None,
-                 heads_groups=(1,), weights_names=None,
+                 heads_groups=(1,), shared_groups=(), weights_names=None,
                  weights_parametrization="abs", weights_normalization="gradnorm", rescale_grad_norm_weights=None,
                  encoder_downstream_weight=0, downstream_merge=False,
-                 encoder_decoder=False, algorithm="sgd", ema=None, warmup=DEFAULT_WARMUP,
+                 encoder_decoder=False, algorithm="sgd", shared_algorithm="none",
+                 ema=None, warmup=DEFAULT_WARMUP,
                  align="train", train_downstream_head="train",
                  regularization=0, apply_optimizer_correction=False, scale_gradients=1,
                  skip_step_zero_weights_limit=5, z_grad_lr=0.001, maxiters=100, eps=1e-8):
@@ -167,8 +167,13 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         if 0 in heads_groups:
             raise ValueError("The first group (index 0) is reserved for weights and can not relate to individual heads.")
+        if 0 in shared_groups:
+            raise ValueError("The first group (index 0) is reserved for weights and can not relate to shared heads.")
+        if set(heads_groups) & set(shared_groups):
+            raise ValueError("Groups intersection.")
         self.heads_groups = list(sorted(set(heads_groups)))
-        encoder_groups = set(range(len(self.param_groups))) - {0} - set(heads_groups)
+        self.shared_groups = list(sorted(set(shared_groups)))
+        encoder_groups = set(range(len(self.param_groups))) - {0} - set(heads_groups) - set(shared_groups)
         self.encoder_groups = list(sorted(encoder_groups))
         self.n_weights = len(self.logits)
         if weights_names is None:
@@ -189,6 +194,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self.downstream_merge = downstream_merge
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
+        self.shared_algorithm = shared_algorithm
         self.align = align
         self.train_downstream_head = train_downstream_head
         self.regularization = regularization
@@ -241,6 +247,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._weights_tracker = StatsTracker("weights", self.stats_momentum)
         self._effective_weights_tracker = StatsTracker("effective_weights", self.stats_momentum)
         self._heads_grad_norm_tracker = StatsTracker("heads_grad_norm", self.stats_momentum, track_median=False)
+        self._shared_grad_norm_tracker = StatsTracker("shared_grad_norm", self.stats_momentum, track_median=False)
         self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.stats_momentum, track_median=False)
         self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum, track_median=False)
 
@@ -277,6 +284,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             result.update(self._n_skipped_steps_tracker.get())
         if self._heads_grad_norm_tracker.last_value is not None:
             result.update(self._heads_grad_norm_tracker.get())
+        if self._shared_grad_norm_tracker.last_value is not None:
+            result.update(self._shared_grad_norm_tracker.get())
         if self._encoder_grad_norm_tracker.last_value is not None:
             result.update(self._encoder_grad_norm_tracker.get())
         for name, normalizer in self._normalizers.items():
@@ -376,6 +385,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         # Caches for normalization differentiation.
         all_z_grads = []
         all_heads_grads = []
+        all_shared_grads = []
         all_encoder_grads = []
 
         # Compute main losses grads.
@@ -387,6 +397,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             if self.encoder_decoder and (z is None or z.grad is None):
                 raise TypeError("In the encoder-decoder mode, closure must return gradient w.r.t. encoder output.")
             heads_grads = self._gather_grads("heads")
+            shared_grads = self._gather_grads("shared")
             if self.encoder_decoder:
                 z_grad = z.grad.flatten().clone()
                 self._normalizers[name](z_grad)
@@ -397,6 +408,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                 all_encoder_grads.append(encoder_grads)
             self._normalizers_trackers[name].update(self._normalizers[name].last_norm)
             all_heads_grads.append(heads_grads)
+            all_shared_grads.append(shared_grads)
 
         return {
             "heads_down_grads": heads_down_grads,
@@ -404,6 +416,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             "z_down": z_down if self.encoder_decoder else None,
             "z_down_grads": z_down_grads if self.encoder_decoder else None,
             "all_heads_grads": all_heads_grads,
+            "all_shared_grads": all_shared_grads,
             "all_encoder_grads": all_encoder_grads if not self.encoder_decoder else None,
             "all_z_grads": all_z_grads if self.encoder_decoder else None
         }
@@ -507,7 +520,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             all_grads_covs.copy_(flat[:covs_numel].view_as(all_grads_covs))
             products.copy_(flat[covs_numel:])
         # Equalize gradient norms.
-        reduced_norms = all_grads_covs.diag().sqrt()  # (W).
+        reduced_norms = all_grads_covs.diag().sqrt().clip(min=self.eps)  # (W).
         all_grads_covs /= reduced_norms[:, None] * reduced_norms[None, :]
         products /= reduced_norms
 
@@ -618,8 +631,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                         numel = p.numel()
                         p.grad = heads_down_grads[offset:offset + numel].reshape(p.shape)
                         offset += numel
-                encoder_group_indices = set(range(len(self.param_groups))) - {0} - set(self.heads_groups)
-                for i in encoder_group_indices:
+                for i in self.encoder_groups:
                     for p in self.param_groups[i]["params"]:
                         p.grad = None
             else:
@@ -757,6 +769,30 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             assert offset == len(heads_grad)
             del heads_grad
 
+            # Set grads for shared heads.
+            shared_grad = torch.stack(grads["all_shared_grads"])
+            if self.shared_algorithm == "weighted":
+                shared_grad = weights @ shared_grad
+            elif self.shared_algorithm == "aligned-mtl":
+                shared_grad = procrustes(shared_grad)
+            else:
+                assert self.shared_algorithm == "none"
+                if self.rescale_grad_norm_weights is not None:
+                    shared_grad = self.rescale_grad_norm_weights @ torch.stack(grads["all_shared_grads"])
+                else:
+                    shared_grad = torch.stack(grads["all_shared_grads"]).sum(0)
+            if self.scale_gradients != 1:
+                shared_grad *= self.scale_gradients
+            self._shared_grad_norm_tracker.update(torch.linalg.norm(shared_grad))
+            offset = 0
+            for i in self.shared_groups:
+                for p in self.param_groups[i]["params"]:
+                    numel = p.numel()
+                    p.grad = shared_grad[offset:offset + numel].reshape(p.shape)
+                    offset += numel
+            assert offset == len(shared_grad)
+            del shared_grad
+
             if after_backward_hook is not None:
                 after_backward_hook()
 
@@ -797,6 +833,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state["weights_tracker"] = self._weights_tracker.state_dict()
         state["effective_weights_tracker"] = self._effective_weights_tracker.state_dict()
         state["heads_grad_norm_tracker"] = self._heads_grad_norm_tracker.state_dict()
+        state["shared_grad_norm_tracker"] = self._shared_grad_norm_tracker.state_dict()
         state["encoder_grad_norm_tracker"] = self._encoder_grad_norm_tracker.state_dict()
         state["correlations_tracker"] = self._correlations_tracker.state_dict()
         return state
@@ -831,6 +868,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._effective_weights_tracker.load_state_dict(state_dict["effective_weights_tracker"])
         if "heads_grad_norm_tracker" in state_dict:
             self._heads_grad_norm_tracker.load_state_dict(state_dict["heads_grad_norm_tracker"])
+        if "shared_grad_norm_tracker" in state_dict:
+            self._shared_grad_norm_tracker.load_state_dict(state_dict["shared_grad_norm_tracker"])
         if "encoder_grad_norm_tracker" in state_dict:
             self._encoder_grad_norm_tracker.load_state_dict(state_dict["encoder_grad_norm_tracker"])
         self._correlations_tracker.load_state_dict(state_dict["correlations_tracker"])
@@ -844,12 +883,14 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             encoder: Encoder part (before embedding) in the encoder-decoder model.
 
         Args:
-            part: Part of the model to extract gradients for (`all`, `heads`, or `encoder`).
+            part: Part of the model to extract gradients for (`all`, `heads`, `shared`, or `encoder`).
         """
         if part == "all":
             param_groups = self.param_groups[1:]
         elif part == "heads":
             param_groups = [self.param_groups[i] for i in self.heads_groups]
+        elif part == "shared":
+            param_groups = [self.param_groups[i] for i in self.shared_groups]
         else:
             assert part == "encoder"
             # All except hyperparameters and individual heads.
@@ -870,6 +911,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             param_groups = self.param_groups[1:]
         elif part == "heads":
             param_groups = [self.param_groups[i] for i in self.heads_groups]
+        elif part == "shared":
+            param_groups = [self.param_groups[i] for i in self.shared_groups]
         else:
             assert part == "encoder"
             # All except hyperparameters and individual heads.
