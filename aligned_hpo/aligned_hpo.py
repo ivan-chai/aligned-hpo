@@ -32,6 +32,10 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         base_optimizer_params: Parameters of the base optimizer.
         weights_optimizer_cls: The optimizer to use for weights. By default equal to base_optimizer_cls.
         weights_optimizer_params: Parameters of the weights optimizer.
+        heads_optimizer_cls: The optimizer to use for individual loss heads (heads_groups) and shared
+            heads (shared_groups). By default, these groups are fit by the base optimizer. If only
+            heads_optimizer_params is provided, base_optimizer_cls is used.
+        heads_optimizer_params: Parameters of the heads optimizer.
         heads_groups: Indices of parameter groups, related to individual loss heads.
         shared_groups: Indices of parameter groups, related to shared loss heads parameters.
         weights_names: An optional list of names for hyperparameters (for logging).
@@ -130,8 +134,9 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     optimizer.hpo_step(closure, closure_encoder)
     ```
     """
-    def __init__(self, params, base_optimizer_cls, weights_optimizer_cls=None,
-                 base_optimizer_params=None, weights_optimizer_params=None,
+    def __init__(self, params, base_optimizer_cls, base_optimizer_params=None,
+                 weights_optimizer_cls=None, weights_optimizer_params=None,
+                 heads_optimizer_cls=None, heads_optimizer_params=None,
                  heads_groups=(1,), shared_groups=(), weights_names=None,
                  weights_parametrization="abs", weights_normalization="gradnorm", rescale_grad_norm_weights=None,
                  encoder_downstream_weight=0, downstream_merge=False,
@@ -155,15 +160,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError(f"Unknown align mode: {align}")
         if train_downstream_head not in ["train", "val", "train-val"]:
             raise ValueError(f"Unknown train downstream head mode: {train_downstream_head}")
-        defaults = dict(base_optimizer_params or {})
-        super().__init__(params, defaults)
+        # Sub-optimizers fill their own defaults into the groups they own, so the outer
+        # optimizer must not pre-populate them with the base optimizer hyperparameters.
+        super().__init__(params, {})
         if weights_optimizer_cls is None:
             weights_optimizer_cls = base_optimizer_cls
-            weights_optimizer_params = base_optimizer_params
-        self.weights_optimizer = weights_optimizer_cls([self.param_groups[0]], **(weights_optimizer_params or {}))
-        self.base_optimizer = base_optimizer_cls(self.param_groups[1:], **(base_optimizer_params or {}))
-        self.param_groups = self.weights_optimizer.param_groups + self.base_optimizer.param_groups
-        self.defaults.update(self.base_optimizer.defaults)
+            if weights_optimizer_params is None:
+                weights_optimizer_params = base_optimizer_params
+        if (heads_optimizer_cls is None) and (heads_optimizer_params is not None):
+            heads_optimizer_cls = base_optimizer_cls
 
         if 0 in heads_groups:
             raise ValueError("The first group (index 0) is reserved for weights and can not relate to individual heads.")
@@ -171,10 +176,48 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             raise ValueError("The first group (index 0) is reserved for weights and can not relate to shared heads.")
         if set(heads_groups) & set(shared_groups):
             raise ValueError("Groups intersection.")
+        n_groups = len(self.param_groups)
+        for i in itertools.chain(heads_groups, shared_groups):
+            if not (0 <= i < n_groups):
+                raise ValueError(f"Group index {i} is out of range for {n_groups} parameter groups.")
         self.heads_groups = list(sorted(set(heads_groups)))
         self.shared_groups = list(sorted(set(shared_groups)))
-        encoder_groups = set(range(len(self.param_groups))) - {0} - set(heads_groups) - set(shared_groups)
+        encoder_groups = set(range(n_groups)) - {0} - set(heads_groups) - set(shared_groups)
         self.encoder_groups = list(sorted(encoder_groups))
+
+        # Split model groups between the base optimizer and the (optional) heads optimizer.
+        if heads_optimizer_cls is not None:
+            heads_optimizer_groups = list(sorted(set(self.heads_groups) | set(self.shared_groups)))
+            if not heads_optimizer_groups:
+                raise ValueError("The heads optimizer is requested, but both heads_groups and shared_groups are empty.")
+            base_optimizer_groups = list(self.encoder_groups)
+            if not base_optimizer_groups:
+                raise ValueError("The heads optimizer is requested, but there are no groups left for the base "
+                                 "optimizer: all groups are listed in heads_groups and shared_groups.")
+        else:
+            heads_optimizer_groups = []
+            base_optimizer_groups = list(range(1, n_groups))
+
+        groups = list(self.param_groups)
+        self.weights_optimizer = weights_optimizer_cls([groups[0]], **(weights_optimizer_params or {}))
+        self.base_optimizer = base_optimizer_cls([groups[i] for i in base_optimizer_groups],
+                                                 **(base_optimizer_params or {}))
+        if heads_optimizer_cls is not None:
+            self.heads_optimizer = heads_optimizer_cls([groups[i] for i in heads_optimizer_groups],
+                                                       **(heads_optimizer_params or {}))
+        else:
+            self.heads_optimizer = None
+        # Group indices (heads_groups, shared_groups, encoder_groups) address self.param_groups,
+        # so the original group order must be restored after the split.
+        self._group_owners = [None] * n_groups
+        self._group_owners[0] = ("weights", 0)
+        for position, i in enumerate(base_optimizer_groups):
+            self._group_owners[i] = ("base", position)
+        for position, i in enumerate(heads_optimizer_groups):
+            self._group_owners[i] = ("heads", position)
+        self._sync_param_groups()
+        self.defaults.update(self.base_optimizer.defaults)
+
         self.n_weights = len(self.logits)
         if weights_names is None:
             weights_names = [str(i) for i in range(self.n_weights)]
@@ -251,6 +294,43 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.stats_momentum, track_median=False)
         self._correlations_tracker = StatsTracker("grad_correlations", self.stats_momentum, track_median=False)
 
+    def _sync_param_groups(self):
+        """Rebuild self.param_groups from the sub-optimizers, keeping the original group order."""
+        sources = {
+            "weights": self.weights_optimizer.param_groups,
+            "base": self.base_optimizer.param_groups,
+        }
+        if self.heads_optimizer is not None:
+            sources["heads"] = self.heads_optimizer.param_groups
+        self.param_groups = [sources[owner][position] for owner, position in self._group_owners]
+
+    def _group_optimizer(self, index):
+        """Get the sub-optimizer which fits the given parameter group."""
+        owner, _ = self._group_owners[index]
+        if owner == "weights":
+            return self.weights_optimizer
+        elif owner == "heads":
+            return self.heads_optimizer
+        assert owner == "base"
+        return self.base_optimizer
+
+    def _group_indices(self, part):
+        """Get indices of the parameter groups for the given model part.
+
+        Args:
+            part: Part of the model (`all`, `heads`, `shared`, or `encoder`).
+        """
+        if part == "all":
+            return list(range(1, len(self.param_groups)))
+        elif part == "heads":
+            return list(self.heads_groups)
+        elif part == "shared":
+            return list(self.shared_groups)
+        else:
+            assert part == "encoder"
+            # All except hyperparameters, individual heads, and shared heads.
+            return list(self.encoder_groups)
+
     @property
     def need_losses(self):
         return False
@@ -300,6 +380,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         if not inner:
             raise ValueError("Please, use 'hpo_step' function.")
         self.base_optimizer.step(closure=closure)
+        if self.heads_optimizer is not None:
+            self.heads_optimizer.step()
         self.weights_optimizer.step()
 
     def _unnormalized_weights(self, reparametrize=True):
@@ -841,16 +923,23 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
     def state_dict(self):
         state = self.base_optimizer.state_dict()
         state["weights_optimizer"] = self.weights_optimizer.state_dict()
+        if self.heads_optimizer is not None:
+            state["heads_optimizer"] = self.heads_optimizer.state_dict()
         state.update(self.hpo_state_dict())
         return state
 
     def load_state_dict(self, state_dict):
         state_dict = dict(state_dict)  # shallow copy — don't mutate caller's dict
         weights_opt_state = state_dict.pop("weights_optimizer", None)
+        heads_opt_state = state_dict.pop("heads_optimizer", None)
+        if (heads_opt_state is None) != (self.heads_optimizer is None):
+            raise ValueError("The heads optimizer is present either in the checkpoint or in the optimizer, but not in both.")
         self.base_optimizer.load_state_dict(state_dict)
         if weights_opt_state is not None:
             self.weights_optimizer.load_state_dict(weights_opt_state)
-        self.param_groups = self.weights_optimizer.param_groups + self.base_optimizer.param_groups
+        if heads_opt_state is not None:
+            self.heads_optimizer.load_state_dict(heads_opt_state)
+        self._sync_param_groups()
         p = self.logits
         self._running_stats.update({k: (v.to(device=p.device, dtype=p.dtype) if v is not None else None)
                                     for k, v in state_dict.get("running_stats", {}).items()})
@@ -885,18 +974,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         Args:
             part: Part of the model to extract gradients for (`all`, `heads`, `shared`, or `encoder`).
         """
-        if part == "all":
-            param_groups = self.param_groups[1:]
-        elif part == "heads":
-            param_groups = [self.param_groups[i] for i in self.heads_groups]
-        elif part == "shared":
-            param_groups = [self.param_groups[i] for i in self.shared_groups]
-        else:
-            assert part == "encoder"
-            # All except hyperparameters and individual heads.
-            param_groups = [self.param_groups[i] for i in self.encoder_groups]
         grads = []
-        for group in param_groups:
+        for group in [self.param_groups[i] for i in self._group_indices(part)]:
             for p in group["params"]:
                 if p.grad is None:
                     grads.append(torch.zeros_like(p).flatten())
@@ -907,23 +986,15 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         return torch.cat(grads)
 
     def apply_optimizer_correction_(self, part, grads):
-        if part == "all":
-            param_groups = self.param_groups[1:]
-        elif part == "heads":
-            param_groups = [self.param_groups[i] for i in self.heads_groups]
-        elif part == "shared":
-            param_groups = [self.param_groups[i] for i in self.shared_groups]
-        else:
-            assert part == "encoder"
-            # All except hyperparameters and individual heads.
-            param_groups = [self.param_groups[i] for i in self.encoder_groups]
-        if isinstance(self.base_optimizer, torch.optim.Adam):
-            offset = 0
-            for group in param_groups:
+        offset = 0
+        for i in self._group_indices(part):
+            group = self.param_groups[i]
+            optimizer = self._group_optimizer(i)  # Groups can be fit by different optimizers.
+            if isinstance(optimizer, torch.optim.Adam):
                 _, beta2 = group["betas"]
                 eps = group["eps"]
                 for p in group["params"]:
-                    state = self.base_optimizer.state[p]
+                    state = optimizer.state[p]
                     exp_avg_sq = state.get("exp_avg_sq", None)
                     if exp_avg_sq is None:
                         offset += p.numel()
@@ -933,8 +1004,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     bias_correction2_sqrt = (1 - beta2 ** step) ** 0.5
                     grads[offset:offset + p.numel()] /= exp_avg_sq.sqrt() / bias_correction2_sqrt + eps
                     offset += p.numel()
-            assert offset == len(grads)
-        elif isinstance(self.base_optimizer, torch.optim.SGD):
-            pass  # No need for correction.
-        else:
-            raise NotImplementedError(f"Can't apply correction to {type(self.base_optimizer).__name__}")
+            elif isinstance(optimizer, torch.optim.SGD):
+                offset += sum(p.numel() for p in group["params"])  # No need for correction.
+            else:
+                raise NotImplementedError(f"Can't apply correction to {type(optimizer).__name__}")
+        assert offset == len(grads)
