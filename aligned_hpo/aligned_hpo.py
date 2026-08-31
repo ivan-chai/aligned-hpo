@@ -192,6 +192,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         }
 
         self._weights_tracker = StatsTracker("weights", self.ema)
+        self._effective_weights_tracker = StatsTracker("effective_weights", self.ema)  # Weights scaled by grad norm.
         self._heads_grad_norm_tracker = StatsTracker("heads_grad_norm", self.ema, track_median=False)
         self._shared_grad_norm_tracker = StatsTracker("shared_grad_norm", self.ema, track_median=False)
         self._encoder_grad_norm_tracker = StatsTracker("encoder_grad_norm", self.ema, track_median=False)
@@ -236,7 +237,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
     @property
     def use_validation(self):
-        return self.align != "train"
+        return False
 
     @property
     def logits(self):
@@ -255,12 +256,19 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             for key, val in self._weights_tracker.get().items():
                 for wname, c in zip(self.weights_names, val):
                     result[f"{key}_{wname}"] = c
+        if self._effective_weights_tracker.last_value is not None:
+            for key, val in self._effective_weights_tracker.get().items():
+                for wname, c in zip(self.weights_names, val):
+                    result[f"{key}_{wname}"] = c
         if self._heads_grad_norm_tracker.last_value is not None:
             result.update(self._heads_grad_norm_tracker.get())
         if self._shared_grad_norm_tracker.last_value is not None:
             result.update(self._shared_grad_norm_tracker.get())
         if self._encoder_grad_norm_tracker.last_value is not None:
             result.update(self._encoder_grad_norm_tracker.get())
+        for name, normalizer in self._normalizers_trackers.items():
+            if normalizer.n_updates > 0:
+                result.update(normalizer.get())
         if self.encoder_decoder and (self._running_stats["encoder_transmission"] is not None):
             result["encoder_transmission"] = self._running_stats["encoder_transmission"]
         return result
@@ -449,6 +457,17 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         self._correlations_tracker.update(products.detach().clone())
         self._weights_tracker.update(weights.detach().clone())
 
+        moving_norms = []
+        for name in self.weights_names:
+            normalizer = self._normalizers_trackers[name]
+            if not normalizer.n_updates:
+                break
+            moving_norms.append(normalizer.ema_value)
+        else:
+            moving_norms = torch.stack(moving_norms).clamp(min=self.eps)
+            effective_weights = weights.detach() * moving_norms
+            self._effective_weights_tracker.update(effective_weights.clone())
+
         self._buffers["n_updates"] += 1
         return grads
 
@@ -585,6 +604,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         state["buffers"] = dict(self._buffers)
         state["normalizers_trackers"] = {k: v.state_dict() for k, v in self._normalizers_trackers.items()}
         state["weights_tracker"] = self._weights_tracker.state_dict()
+        state["effective_weights_tracker"] = self._effective_weights_tracker.state_dict()
         state["heads_grad_norm_tracker"] = self._heads_grad_norm_tracker.state_dict()
         state["shared_grad_norm_tracker"] = self._shared_grad_norm_tracker.state_dict()
         state["encoder_grad_norm_tracker"] = self._encoder_grad_norm_tracker.state_dict()
@@ -613,6 +633,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
             self._normalizers_trackers[k].load_state_dict(v)
         if "weights_tracker" in state_dict:
             self._weights_tracker.load_state_dict(state_dict["weights_tracker"])
+        if "effective_weights_tracker" in state_dict:
+            self._effective_weights_tracker.load_state_dict(state_dict["effective_weights_tracker"])
         if "heads_grad_norm_tracker" in state_dict:
             self._heads_grad_norm_tracker.load_state_dict(state_dict["heads_grad_norm_tracker"])
         if "shared_grad_norm_tracker" in state_dict:
