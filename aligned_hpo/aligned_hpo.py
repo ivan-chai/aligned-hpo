@@ -37,6 +37,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
         algorithm: Either "sgd" or "none" to disable HPO.
         apply_optimizer_correction: Try to approximate an actual optimizer step rather than simple SGD.
         scale_gradients: A fixed scale for gradients.
+        synchronize: Multi-GPU synchronization method. Use "grads" for accuracy and "stats" for fast approximation.
         eps: Roughly the square root of the minimum gradients correlation value.
 
     NOTE. Algorithm.
@@ -112,7 +113,8 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                  heads_groups=(1,), shared_groups=(), weights_names=None,
                  weights_parametrization="abs", weights_normalization="gradnorm",
                  encoder_decoder=False, ema=0.9, algorithm="sgd",
-                 apply_optimizer_correction=False, scale_gradients=1, eps=1e-8):
+                 apply_optimizer_correction=False, scale_gradients=1,
+                 synchronize="stats", eps=1e-8):
         params = list(params)
         if len(params) < 3 or not isinstance(params[0], dict) or not isinstance(params[1], dict):
             raise ValueError("Expected at least three param groups with the first group being hyperparameters weights, the second group being projection heads weights, and the third group being encoder weights.")
@@ -174,6 +176,7 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
 
         self.encoder_decoder = encoder_decoder
         self.algorithm = algorithm
+        self.synchronize = synchronize
         self.eps = eps
 
         self.ema = ema
@@ -426,21 +429,31 @@ class AlignedHPOptimizer(torch.optim.Optimizer):
                     self.apply_optimizer_correction_("encoder", loss_grads)
             all_grads.append(loss_grads)
 
+        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
+
         all_grads = torch.stack(all_grads, 0)  # (W, P).
-        all_grads_covs = all_grads @ all_grads.T
-        products = all_grads @ down_grads  # (W).
+
+        if is_distributed:
+            world_size = torch.distributed.get_world_size()
+            if self.synchronize == "grads":
+                torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(down_grads, op=torch.distributed.ReduceOp.SUM)
+                all_grads_covs = (all_grads @ all_grads.T) / (world_size ** 2)
+                products = (all_grads @ down_grads) / (world_size ** 2)  # (W).
+            else:
+                assert self.synchronize == "stats"
+                all_grads_covs = all_grads @ all_grads.T
+                products = all_grads @ down_grads  # (W).
+                flat = torch.cat([all_grads_covs.flatten(), products])
+                torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+                covs_numel = all_grads_covs.numel()
+                all_grads_covs.copy_(flat[:covs_numel].view_as(all_grads_covs) / world_size)
+                products.copy_(flat[covs_numel:] / world_size)
+        else:
+            all_grads_covs = all_grads @ all_grads.T
+            products = all_grads @ down_grads  # (W).
         del all_grads
         del down_grads
-
-        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized() and (torch.distributed.get_world_size() > 1)
-        if is_distributed:
-            # Merge two all_reduces into one by concatenating tensors.
-            world_size = torch.distributed.get_world_size()
-            flat = torch.cat([all_grads_covs.flatten(), products])
-            torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
-            covs_numel = all_grads_covs.numel()
-            all_grads_covs.copy_(flat[:covs_numel].view_as(all_grads_covs) / world_size)
-            products.copy_(flat[covs_numel:] / world_size)
 
         all_grads_covs = self._update_running_stats(all_grads_covs, "covs")
         products = self._update_running_stats(products, "products")
